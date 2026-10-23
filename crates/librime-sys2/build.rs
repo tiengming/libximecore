@@ -97,6 +97,10 @@ fn cmake_build(librime: &std::path::Path) -> Option<PathBuf> {
         .args([
             "--build",
             build_dir.to_str().unwrap(),
+            // VS 多配置生成器必须显式指定 Release：不传时默认 Debug，
+            // 而 `build/` 里可能只有 Release 配置（`MSB8013` 就是这么来的）。
+            "--config",
+            "Release",
             "--target",
             "install",
             "-j",
@@ -163,12 +167,25 @@ fn build_windows() {
     if rime_dll.exists() {
         println!("cargo:rustc-link-search=native={}", dist_lib_dir.display());
         println!("cargo:rustc-link-lib=dylib=rime");
-        let workspace_dir = librime.parent().unwrap();
-        for profile in &["debug", "release"] {
-            let target_dir = workspace_dir.join("target").join(profile);
-            if target_dir.exists() {
-                std::fs::copy(&rime_dll, target_dir.join("rime.dll")).ok();
+        // rime.dll 要放在 exe 旁边。**不能**再用 `librime.parent()` 猜工作区：
+        // 那是 libximecore 的目录，产物会落到 `libximecore/target/`，而真正要打包的
+        // `XimeYao/target/<profile>/` 一直是旧文件（结果就是"重新编了 rime.dll 但
+        // 实际跑的还是老的"）。用 cargo 给的 OUT_DIR 反推当前构建目录才可靠：
+        //   <target>/<profile>/build/<pkg>-<hash>/out → 上溯 3 级是 <target>/<profile>
+        let copied = std::env::var_os("OUT_DIR")
+            .map(std::path::PathBuf::from)
+            .and_then(|out| out.ancestors().nth(3).map(|p| p.to_path_buf()))
+            .map(|profile_dir| {
+                let dest = profile_dir.join("rime.dll");
+                let ok = std::fs::copy(&rime_dll, &dest).is_ok();
+                (dest, ok)
+            });
+        match copied {
+            Some((dest, true)) => println!("cargo:warning=rime.dll → {}", dest.display()),
+            Some((dest, false)) => {
+                println!("cargo:warning=复制 rime.dll 到 {} 失败", dest.display())
             }
+            None => println!("cargo:warning=拿不到 OUT_DIR，rime.dll 未复制到输出目录"),
         }
     } else {
         panic!(

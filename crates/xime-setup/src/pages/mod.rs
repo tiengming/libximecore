@@ -14,7 +14,6 @@ pub mod clipboard;
 pub mod pair;
 #[cfg(feature = "smart-suggestion-page")]
 pub mod smart_suggestion;
-#[cfg(target_os = "linux")]
 #[cfg(feature = "voice-page")]
 pub mod voice;
 

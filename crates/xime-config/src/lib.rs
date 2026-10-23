@@ -5,6 +5,7 @@ pub mod schema_config;
 pub mod schema_manager;
 pub mod schema_manifest;
 pub mod style;
+pub mod user_config;
 pub mod wubi_radicals;
 
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,7 @@ pub use schema_config::{
     ReverseLookupConfig, SchemaConfig, SchemaConfigManager, SpellerConfig, TraditionConfig,
     TranslatorConfig,
 };
-pub use schema_manager::SchemaManager;
+pub use schema_manager::{set_page_size_in, SchemaManager};
 pub use schema_manifest::{
     is_protected_release_path, is_trackable_path, is_user_data_path, package_label, FileConflict,
     PackageEntry, Registry, SchemaManifest, UninstallOutcome, BUILTIN_PACKAGE_ID,
@@ -32,6 +33,10 @@ pub use style::ColorScheme;
 pub use style::ColorSchemeConfig;
 pub use style::DarkMode;
 pub use style::StyleConfig;
+pub use user_config::{
+    backup_path, original_path, restore_defaults_at, restore_original_at, state_at, undo_at,
+    write_overrides_at, ConfigFileState,
+};
 pub use wubi_radicals::{KeyRadicalsConfig, WubiRadicalsConfig};
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -53,52 +58,53 @@ pub struct XimeConfig {
 
 impl XimeConfig {
     pub fn load() -> Self {
-        // 1. Builtin defaults
-        let mut config = Self::builtin_default();
-
-        // 2. System config
-        if let Some(system) = Self::load_system_config() {
-            config = Self::merge_configs(config, system);
-        }
-
-        // 3. User config
-        if let Some(user) = Self::load_user_config() {
-            config = Self::merge_configs(config, user);
-        }
-
-        config
+        Self::load_from(&Self::user_config_path())
     }
 
-    fn load_system_config() -> Option<Self> {
+    /// 从指定用户文件加载（测试/多实例用；生产走 [`XimeConfig::load`]）。
+    ///
+    /// 三层按 **YAML 树**深合并：内置 → 系统级 → 用户级。不是按结构体字段替换——
+    /// 用户只写 `style.font_size` 时，`style` 的其它字段必须仍是默认值，而不是被
+    /// `[serde(default)]` 打回硬编码默认。
+    pub fn load_from(user_path: &std::path::Path) -> Self {
+        let mut tree = Self::default_tree();
         for path in Self::system_config_paths() {
-            if path.exists() {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if let Ok(config) = serde_yaml::from_str::<XimeConfig>(&content) {
-                        return Some(config);
-                    }
-                }
+            if let Some(value) = read_tree(&path) {
+                user_config::deep_merge(&mut tree, value);
             }
         }
-        None
+        if let Some(value) = read_tree(user_path) {
+            user_config::deep_merge(&mut tree, value);
+        }
+        match serde_yaml::from_value(tree) {
+            Ok(config) => config,
+            Err(_) => Self::builtin_default(),
+        }
     }
 
-    fn load_user_config() -> Option<Self> {
-        let path = Self::user_config_path();
-        if path.exists() {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if let Ok(config) = serde_yaml::from_str::<XimeConfig>(&content) {
-                    return Some(config);
-                }
+    /// 内置 + 系统级（**不含**用户文件）——保存差异时的基线。
+    pub fn load_defaults() -> Self {
+        let mut tree = Self::default_tree();
+        for path in Self::system_config_paths() {
+            if let Some(value) = read_tree(&path) {
+                user_config::deep_merge(&mut tree, value);
             }
         }
-        None
+        match serde_yaml::from_value(tree) {
+            Ok(config) => config,
+            Err(_) => Self::builtin_default(),
+        }
+    }
+
+    fn default_tree() -> serde_yaml::Value {
+        const DEFAULT_CONFIG: &[u8] = include_bytes!("../../../resources/xime.yaml");
+        serde_yaml::from_slice(DEFAULT_CONFIG).unwrap_or(serde_yaml::Value::Null)
     }
 
     fn builtin_default() -> Self {
         const DEFAULT_CONFIG: &[u8] = include_bytes!("../../../resources/xime.yaml");
         serde_yaml::from_slice(DEFAULT_CONFIG).unwrap_or_default()
     }
-
     fn system_config_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
         let meta = app_metadata();
@@ -179,44 +185,57 @@ impl XimeConfig {
         PathBuf::from(custom_file)
     }
 
-    fn merge_configs(base: Self, over: Self) -> Self {
-        XimeConfig {
-            wubi_radicals: WubiRadicalsConfig {
-                hotkeys: over.wubi_radicals.hotkeys,
-                schema_radicals: if over.wubi_radicals.schema_radicals.is_empty() {
-                    base.wubi_radicals.schema_radicals
-                } else {
-                    over.wubi_radicals.schema_radicals
-                },
-            },
-            style: over.style,
-            color_schemes: if over.color_schemes.is_empty() {
-                base.color_schemes
-            } else {
-                over.color_schemes
-            },
-            pair_secret: if over.pair_secret.is_empty() {
-                base.pair_secret
-            } else {
-                over.pair_secret
-            },
-            log_level: over.log_level.clone().or(base.log_level),
-        }
-    }
-
     pub fn config_path() -> PathBuf {
         Self::user_config_path()
     }
 
+    /// 保存用户配置：**只写与默认值的差异**，并保留用户手写的其它键。
+    ///
+    /// 之前的实现是 `serde_yaml::to_string(self)` 整份覆盖：外观页点一下就会把
+    /// 5KB 的 `wubi_radicals`、全套内置配色、甚至 `pair_secret` 全灌进用户文件，
+    /// 用户自己写的段（移动端的 `keyboard:` 等）会被直接抹掉。
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::config_path();
-        let content = serde_yaml::to_string(self)
-            .map_err(|e| format!("Failed to serialize config: {}", e))?;
+        self.save_to(&Self::config_path())
+    }
 
-        atomic_write(&path, content.as_bytes())
-            .map_err(|e| format!("Failed to write config: {e}"))?;
+    /// 见 [`XimeConfig::save`]；路径可指定（测试用）。
+    pub fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
+        let mine = serde_yaml::to_value(self)
+            .map_err(|e| format!("Failed to serialize config: {e}"))?;
+        let baseline = serde_yaml::to_value(Self::load_defaults())
+            .map_err(|e| format!("Failed to serialize defaults: {e}"))?;
 
-        Ok(())
+        // 我们负责的顶层键 = 结构体能序列化出来的键集合（新增字段自动纳管）。
+        let managed: Vec<String> = match &mine {
+            serde_yaml::Value::Mapping(map) => map
+                .keys()
+                .filter_map(|k| k.as_str().map(str::to_string))
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        let overrides = user_config::deep_diff(&mine, &baseline);
+        user_config::write_overrides_at(path, overrides, &managed)
+    }
+
+    /// 用户配置文件状态（是否存在 / 可否撤销 / 是否有用户初始版本）。
+    pub fn file_state() -> user_config::ConfigFileState {
+        user_config::state_at(&Self::config_path())
+    }
+
+    /// 撤销上一次保存（用 `.bak` 覆盖回去）。
+    pub fn undo_last_save() -> Result<(), String> {
+        user_config::undo_at(&Self::config_path())
+    }
+
+    /// 恢复为客户端默认：删除用户文件（= 回到内置 + 系统级）。
+    pub fn restore_defaults() -> Result<(), String> {
+        user_config::restore_defaults_at(&Self::config_path())
+    }
+
+    /// 恢复为用户最初提供的版本（第一次被程序改写前的那份 `.orig`）。
+    pub fn restore_original() -> Result<(), String> {
+        user_config::restore_original_at(&Self::config_path())
     }
 
     pub fn get_primary_color(&self) -> (u8, u8, u8) {
@@ -296,6 +315,12 @@ impl XimeConfig {
             _ => "info",
         }
     }
+}
+
+/// 读一份 YAML 文件成值树；不存在/解析失败都当"没有这一层"。
+fn read_tree(path: &std::path::Path) -> Option<serde_yaml::Value> {
+    let text = fs::read_to_string(path).ok()?;
+    serde_yaml::from_str(&text).ok()
 }
 
 // Logging support (cross-platform)
@@ -476,31 +501,34 @@ mod tests {
     }
 
     /// 合并语义：上层配置显式设置了 log_level 才覆盖；未设时保留下层值。
+    ///
+    /// 现在合并发生在 YAML 树层面（`deep_merge`），所以"未设"就是"键不存在"；
+    /// 序列化时 `log_level` 带 `skip_serializing_if`，天然不会出现空值覆盖。
     #[test]
     fn merge_log_level_precedence() {
-        let base = XimeConfig {
-            log_level: Some("info".to_string()),
-            ..XimeConfig::default()
+        let merge = |base: serde_yaml::Value, over: serde_yaml::Value| -> XimeConfig {
+            let mut tree = base;
+            user_config::deep_merge(&mut tree, over);
+            serde_yaml::from_value(tree).unwrap()
         };
-        let over = XimeConfig {
-            log_level: Some("debug".to_string()),
-            ..XimeConfig::default()
+        let with = |level: &str| {
+            serde_yaml::to_value(XimeConfig {
+                log_level: Some(level.to_string()),
+                ..XimeConfig::default()
+            })
+            .unwrap()
         };
-        assert_eq!(
-            XimeConfig::merge_configs(base.clone(), over).effective_log_level(),
-            "debug"
-        );
 
-        // 上层未设：保留下层的 debug（不能被空值打回 info）
-        let base = XimeConfig {
-            log_level: Some("debug".to_string()),
-            ..XimeConfig::default()
-        };
-        let over = XimeConfig::default();
-        assert_eq!(
-            XimeConfig::merge_configs(base, over).effective_log_level(),
-            "debug"
+        // 上层设了 → 覆盖
+        let merged = merge(with("info"), with("debug"));
+        assert_eq!(merged.effective_log_level(), "debug");
+
+        // 上层没设 → 保留下层的 debug（不能被空值打回 info）
+        let merged = merge(
+            with("debug"),
+            serde_yaml::to_value(XimeConfig::default()).unwrap(),
         );
+        assert_eq!(merged.effective_log_level(), "debug");
     }
 
     /// 序列化不回写未设置的 log_level（setup 保存配置不应引入 null/空键）。
