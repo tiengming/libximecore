@@ -50,8 +50,86 @@ fn replace_schema_list(content: &str, new_list: &str) -> String {
     result
 }
 
+/// 写 `default.custom.yaml` 里的 `patch.menu.page_size`（不需要初始化 librime）。
+///
+/// 单独拆成自由函数：服务端只想改这一个键，没必要为了它去 `initialize` rime。
+/// 返回是否真的改动（已一致时返回 `false`，调用方可据此决定要不要部署）。
+///
+/// 只改默认层：方案自己的 `menu.page_size` 会压过它，所以**方案包里写死的 page_size
+/// 要由方案自己删掉**（`xime-docs` 的约定：候选数量归 xime 管，方案不要写 page_size）。
+pub fn set_page_size_in(user_dir: &std::path::Path, page_size: usize) -> Result<bool, String> {
+    write_page_size_file(&user_dir.join("default.custom.yaml"), page_size)
+}
+
+/// `default.custom.yaml` 的文件头：这份文件归 Xime 管，用户不要手改。
+const DEFAULT_CUSTOM_HEADER: &str = "# default.custom.yaml —— Xime固定配置（不随 assets/rime 方案 submodule 分发）\n\
+# 安装/启动或设置变动时自动同步到用户 rime 目录，部署时 patch 到 default.yaml，\n\
+# 请勿在此手工调整；其余 patch 节为默认配置基线，修改后随 app 更新生效。\n";
+
+/// 只改 `patch.menu.page_size`，其余 YAML 原样保留；返回是否改动。
+fn write_page_size_file(path: &std::path::Path, page_size: usize) -> Result<bool, String> {
+    let page_size = page_size.clamp(1, 10);
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut tree: serde_yaml::Value =
+        serde_yaml::from_str(&text).unwrap_or(serde_yaml::Value::Null);
+    if !tree.is_mapping() {
+        tree = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+
+    let current = tree
+        .get("patch")
+        .and_then(|patch| patch.get("menu"))
+        .and_then(|menu| menu.get("page_size"))
+        .and_then(|value| value.as_i64());
+    if current == Some(page_size as i64) {
+        return Ok(false);
+    }
+
+    if let Some(patch) = ensure_child_mapping(&mut tree, "patch") {
+        if let Some(menu) = ensure_child_mapping(patch, "menu") {
+            if let Some(map) = menu.as_mapping_mut() {
+                map.insert(
+                    serde_yaml::Value::String("page_size".to_string()),
+                    serde_yaml::Value::Number((page_size as u64).into()),
+                );
+            }
+        }
+    }
+
+    let body = serde_yaml::to_string(&tree).map_err(|e| format!("序列化 {} 失败: {e}", path.display()))?;
+    // `default.custom.yaml` 是 Xime 固定配置：写入时带上说明头，避免用户以为是自己的文件。
+    let is_default_custom = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name == "default.custom.yaml")
+        .unwrap_or(false);
+    let content = if is_default_custom {
+        format!("{DEFAULT_CUSTOM_HEADER}{body}")
+    } else {
+        body
+    };
+    crate::atomic_write(path, content.as_bytes())
+        .map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
+    Ok(true)
+}
+
 pub struct SchemaManager {
     user_dir: std::path::PathBuf,
+}
+
+/// 取（必要时建）`parent[key]` 的映射，用来逐层写配置而不动其它键。
+fn ensure_child_mapping<'a>(
+    parent: &'a mut serde_yaml::Value,
+    key: &str,
+) -> Option<&'a mut serde_yaml::Value> {
+    let map = parent.as_mapping_mut()?;
+    let entry = map
+        .entry(serde_yaml::Value::String(key.to_string()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    if !entry.is_mapping() {
+        *entry = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+    Some(entry)
 }
 
 impl SchemaManager {
@@ -59,6 +137,16 @@ impl SchemaManager {
         init_rime_deployer()?;
         let (_, user_dir) = get_data_dirs();
         Ok(Self { user_dir })
+    }
+
+    /// 让 rime 的 `menu/page_size` 与候选栏显示数量一致（写 `default.custom.yaml`）。
+    ///
+    /// 候选来自 librime 的**一页**：`style.candidate_count` 想显示 7 个，
+    /// `menu/page_size` 就必须 ≥ 7，否则候选栏最多只有 5 个可显示
+    /// （「候选词数量」调大没反应，十有八九是这个）。只改这一个键，
+    /// 文件里其它 patch 原样保留；返回是否真的改动（改动后要部署才生效）。
+    pub fn set_page_size(&self, page_size: usize) -> Result<bool, String> {
+        set_page_size_in(&self.user_dir, page_size)
     }
 
     pub fn get_schema_list(&self) -> Vec<SchemaInfo> {
@@ -218,6 +306,38 @@ fn extract_schema_name(content: &str, schema_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `menu/page_size` 落盘：只改这一个键，其它 patch 原样保留；已一致时不重复写。
+    #[test]
+    fn page_size_written_without_touching_other_patch_keys() {
+        let dir = std::env::temp_dir().join(format!("xime_pagesize_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("default.custom.yaml");
+        std::fs::write(
+            &path,
+            "patch:\n  schema_list:\n    - schema: moqi_wan_flypymo\n",
+        )
+        .unwrap();
+
+        assert_eq!(set_page_size_in(&dir, 7), Ok(true));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# default.custom.yaml"), "缺少固定配置说明头: {text}");
+        assert!(text.contains("page_size: 7"), "{text}");
+        assert!(text.contains("moqi_wan_flypymo"), "其它 patch 被删: {text}");
+
+        // 已经一致：返回 false，文件内容不变
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(set_page_size_in(&dir, 7), Ok(false));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // 改成别的值：覆盖，且仍然保留 schema_list
+        assert_eq!(set_page_size_in(&dir, 9), Ok(true));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("page_size: 9"), "{text}");
+        assert!(text.contains("moqi_wan_flypymo"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_schema_list_uses_rime_wubi_not_system() {

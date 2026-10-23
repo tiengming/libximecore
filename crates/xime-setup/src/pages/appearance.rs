@@ -1,5 +1,8 @@
 use crate::components::settings::{settings_group, settings_item, settings_page};
-use crate::components::widgets::{button_primary, number_input, pick_list_style};
+use crate::components::widgets::{
+    button_danger, button_disabled, button_primary, button_secondary, number_input,
+    pick_list_style,
+};
 use crate::state::{Message, SettingsState};
 use crate::theme::ThemeColors;
 use iced::widget::{pick_list, row};
@@ -134,12 +137,12 @@ pub fn view<'a>(settings: &'a SettingsState, colors: &'a ThemeColors) -> Element
                     ),
                     settings_item(
                         "候选词数量",
-                        Some("候选词列表中显示的数量"),
+                        Some("候选词列表中显示的数量（1–10，第 10 个用 0 选）"),
                         colors,
                         number_input(
                             appearance.candidate_count as f64,
                             1.0,
-                            20.0,
+                            10.0,
                             1.0,
                             colors,
                             |v| Message::CandidateCountChanged(v as i32),
@@ -164,12 +167,42 @@ pub fn view<'a>(settings: &'a SettingsState, colors: &'a ThemeColors) -> Element
                 "操作",
                 None::<String>,
                 colors,
-                vec![row![button_primary(
-                    "保存外观设置",
-                    colors,
-                    Message::SaveAppearance
-                )]
-                .into()],
+                vec![
+                    row![button_primary(
+                        "保存外观设置",
+                        colors,
+                        Message::SaveAppearance
+                    )]
+                    .into(),
+                    // 配置文件本身的操作：撤销上一次修改 / 恢复默认（删掉用户文件）/
+                    // 恢复为用户最初提供的那份（`.orig`，仅在程序改写前存在过时可用）。
+                    {
+                        let file_state = SettingsState::config_file_state();
+                        let undo = if file_state.backup {
+                            button_secondary("撤销上一次修改", colors, Message::UndoConfigChange)
+                                .into()
+                        } else {
+                            button_disabled("撤销上一次修改", colors)
+                        };
+                        let restore_original = if file_state.original {
+                            button_secondary(
+                                "恢复为用户提供的配置",
+                                colors,
+                                Message::RestoreConfigOriginal,
+                            )
+                            .into()
+                        } else {
+                            button_disabled("恢复为用户提供的配置", colors)
+                        };
+                        let restore_defaults = if file_state.user_file {
+                            button_danger("恢复默认配置", colors, Message::RestoreConfigDefaults)
+                                .into()
+                        } else {
+                            button_disabled("恢复默认配置", colors)
+                        };
+                        row![undo, restore_original, restore_defaults].spacing(8).into()
+                    },
+                ],
             ),
         ],
     )

@@ -23,7 +23,8 @@ pub use speech_models::{
 pub use state::SettingsState;
 pub use state::{
     set_notify_deploy, set_notify_deploy_toast, set_notify_message, set_notify_reload_plugins,
-    set_notify_reload_style, set_notify_select_schema, set_notify_sync_user_data,
+    set_notify_current_schema, set_notify_reload_style, set_notify_select_schema,
+    set_notify_sync_user_data,
 };
 #[cfg(any(windows, feature = "dict-page"))]
 pub use state::{

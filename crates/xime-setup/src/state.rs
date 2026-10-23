@@ -83,6 +83,9 @@ static NOTIFY_SELECT_SCHEMA: OnceLock<fn(&str) -> bool> = OnceLock::new();
 static NOTIFY_MESSAGE: OnceLock<fn(&str, &str)> = OnceLock::new();
 static NOTIFY_RELOAD_PLUGINS: OnceLock<fn()> = OnceLock::new();
 static NOTIFY_SYNC_USER_DATA: OnceLock<fn() -> bool> = OnceLock::new();
+/// 读宿主**实际**在用的方案 id（服务端 `status.schema_id`）。
+/// 未注册回调或服务未运行 → None。「当前方案」不能只靠本地下标猜。
+static NOTIFY_CURRENT_SCHEMA: OnceLock<fn() -> Option<String>> = OnceLock::new();
 /// 部署结果系统通知（平台通知由宿主实现；libximecore 保持平台无关）。
 static NOTIFY_DEPLOY_TOAST: OnceLock<fn(&str, &str)> = OnceLock::new();
 
@@ -171,10 +174,22 @@ pub fn set_notify_sync_user_data(f: fn() -> bool) {
     let _ = NOTIFY_SYNC_USER_DATA.set(f);
 }
 
+/// 注册宿主进程的「读当前方案 id」回调（服务端 status.schema_id）。
+/// 设置页用它把「当前方案」标在真正在用的那一行上——列表是按显示名排序的，
+/// 光靠下标会一直标到字母序最前的方案（比如 Emoji）。
+pub fn set_notify_current_schema(f: fn() -> Option<String>) {
+    let _ = NOTIFY_CURRENT_SCHEMA.set(f);
+}
+
 /// 触发 rime 用户资料同步；false = 服务器未运行或同步失败。
 #[cfg(feature = "backup-page")]
 pub fn notify_sync_user_data() -> bool {
     NOTIFY_SYNC_USER_DATA.get().map(|f| f()).unwrap_or(false)
+}
+
+/// 读宿主当前方案 id；未注册/服务未运行返回 None。
+fn notify_current_schema() -> Option<String> {
+    NOTIFY_CURRENT_SCHEMA.get().and_then(|f| f())
 }
 
 // ---- 词典管理回调（host 注册，Windows；对齐 weasel DictManagementDialog）----
@@ -546,6 +561,12 @@ pub enum Message {
     DarkModeChanged(u8),
     /// 外观：保存。
     SaveAppearance,
+    /// 配置：恢复为客户端默认（删除用户配置文件）。
+    RestoreConfigDefaults,
+    /// 配置：撤销上一次修改（`.bak` 快照）。
+    UndoConfigChange,
+    /// 配置：恢复为用户最初提供的版本（`.orig` 快照）。
+    RestoreConfigOriginal,
     #[cfg(feature = "smart-suggestion-page")]
     SaveSmartSuggestion,
     #[cfg(feature = "clipboard-page")]
@@ -950,6 +971,19 @@ impl SettingsState {
                     !builtin_has_schema && !manifest.builtin_backup_files().is_empty();
             }
             self.input_schema.available_schemas = schemas;
+            // 「当前方案」是**下标**，而列表按显示名排序（Emoji 这类 ASCII 名永远排最前）。
+            // 首次加载/重载时按服务端实际方案反查一次；查不到（服务没起/回调未注册）
+            // 才保留原下标，绝不让「当前」标记与引擎各说各话。
+            if let Some(current) = notify_current_schema() {
+                if let Some(index) = self
+                    .input_schema
+                    .available_schemas
+                    .iter()
+                    .position(|s| s.schema_id == current)
+                {
+                    self.input_schema.selected_schema = index;
+                }
+            }
             self.input_schema.schema_packages = packages;
             self.input_schema.deployed_schema_ids = deployed_schema_ids();
             self.schemas_loaded = true;
@@ -1000,11 +1034,22 @@ impl SettingsState {
 
     pub fn save_appearance(&self) -> Result<(), String> {
         let mut config = XimeConfig::load();
+        // 候选数量要落成 rime 的 `menu/page_size`，**必须重新部署**才生效；
+        // 字号/配色/圆角靠配置缓存（用户文件 mtime）即时生效，不用部署。
+        let count_changed = config.style.candidate_count != self.appearance.candidate_count;
         config.style.font_size = self.appearance.font_size as f32;
         config.style.candidate_count = self.appearance.candidate_count;
         config.style.corner_radius = self.appearance.corner_radius as f32;
+        // 配色也并在这一次写入里：分两次 save 会留两份快照，
+        // 「撤销上一次修改」就只能退掉一半（改字号撤销后配色还是新的）。
+        config.style.color_scheme = self.appearance.color_scheme.clone();
+        config.style.dark_mode = self.appearance.dark_mode;
         config.save()?;
-        notify_daemon_reload_style();
+        if count_changed {
+            notify_daemon_reload();
+        } else {
+            notify_daemon_reload_style();
+        }
         Ok(())
     }
 
@@ -1014,6 +1059,37 @@ impl SettingsState {
     /// 宿主的 `SelectSchema` 只接受已有 build 产物的方案（避免死会话），而产物
     /// 只可能来自启用列表——列表不落盘，兜底部署也编不出这个方案。
     /// 目标没产物时不再同步部署（数秒，会冻住设置窗口），改成后台任务。
+    /// 配置文件的快照状态（页面据此决定哪几个按钮可点）。
+    pub fn config_file_state() -> xime_config::ConfigFileState {
+        XimeConfig::file_state()
+    }
+
+    /// 恢复默认：删掉用户配置文件，回到内置 + 系统级。
+    pub fn restore_config_defaults(&mut self) -> Result<String, String> {
+        XimeConfig::restore_defaults()?;
+        Ok(self.after_config_restore("已恢复默认配置（已删除用户配置文件）"))
+    }
+
+    /// 撤销上一次修改：用保存时留下的 `.bak` 快照覆盖回去。
+    pub fn undo_config_change(&mut self) -> Result<String, String> {
+        XimeConfig::undo_last_save()?;
+        Ok(self.after_config_restore("已撤销上一次修改"))
+    }
+
+    /// 恢复为用户最初提供的版本（程序第一次改写前的那份文件）。
+    pub fn restore_config_original(&mut self) -> Result<String, String> {
+        XimeConfig::restore_original()?;
+        Ok(self.after_config_restore("已恢复为用户提供的配置"))
+    }
+
+    /// 恢复/撤销之后：把界面字段重读一遍，并让宿主重载样式。
+    fn after_config_restore(&mut self, message: &str) -> String {
+        self.appearance.color_schemes_loaded = false;
+        self.load_color_schemes();
+        notify_daemon_reload_style();
+        message.to_string()
+    }
+
     pub fn save_schema(&self) -> Result<String, String> {
         if self.input_schema.selected_schema >= self.input_schema.available_schemas.len() {
             return Ok(String::new());
@@ -1218,10 +1294,12 @@ impl SettingsState {
                 Err(e) => {
                     self.market_schema.loading = false;
                     self.market_schema.error = Some(format!("解析失败: {}", e));
+                    tracing::warn!("方案索引解析失败: {e}");
                 }
             },
             Err(e) => {
                 self.market_schema.loading = false;
+                tracing::warn!("方案索引拉取失败: {e}");
                 self.market_schema.error = Some(e);
             }
         }
@@ -1329,10 +1407,12 @@ impl SettingsState {
                 Err(e) => {
                     self.market_model.loading = false;
                     self.market_model.error = Some(format!("解析失败: {}", e));
+                    tracing::warn!("模型索引解析失败: {e}");
                 }
             },
             Err(e) => {
                 self.market_model.loading = false;
+                tracing::warn!("模型索引拉取失败: {e}");
                 self.market_model.error = Some(e);
             }
         }
@@ -1622,10 +1702,12 @@ impl SettingsState {
                 Err(e) => {
                     self.market_plugin.loading = false;
                     self.market_plugin.error = Some(format!("解析失败: {}", e));
+                    tracing::warn!("插件索引解析失败: {e}");
                 }
             },
             Err(e) => {
                 self.market_plugin.loading = false;
+                tracing::warn!("插件索引拉取失败: {e}");
                 self.market_plugin.error = Some(e);
             }
         }
@@ -2381,7 +2463,11 @@ pub(crate) fn http_client() -> &'static reqwest::blocking::Client {
     CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(30))
-            .timeout(std::time::Duration::from_secs(0))
+            // `timeout(0)` **不是**"不限"：reqwest 会把它当成零时长 → 请求立刻 TimedOut。
+            // 商店/模型/插件三个索引与下载都走这个客户端，之前全部因此失败
+            // （表现就是「网络错误」，而浏览器打开同一个 URL 一切正常）。
+            // `None` 才是真正的不限总时长（连接阶段仍受上面的 connect_timeout 约束）。
+            .timeout(None::<std::time::Duration>)
             .build()
             .expect("failed to build http client")
     })
@@ -5589,6 +5675,33 @@ fn extract_tar_gz(archive_path: &std::path::Path, dest: &std::path::Path) -> any
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 手动跑（`--ignored --nocapture`）：复现商店「获取索引失败」的真实原因。
+    ///
+    /// 走的就是设置页同一条路径（`http_client()` + 同一个 URL），所以打印出来的
+    /// 错误链与用户看到的一致；不联网时不要跑。
+    #[test]
+    #[ignore = "需要联网，手动跑"]
+    fn rimes_index_reachable() {
+        let url = "https://index.ximei.me/rimes/index.yaml";
+        match http_client().get(url).send() {
+            Ok(response) => {
+                let status = response.status();
+                match response.text() {
+                    Ok(text) => println!("OK status={status} bytes={}", text.len()),
+                    Err(e) => println!("READ FAIL: {e:?}"),
+                }
+            }
+            Err(e) => {
+                println!("SEND FAIL: {e:?}");
+                let mut source = std::error::Error::source(&e);
+                while let Some(err) = source {
+                    println!("  caused by: {err}");
+                    source = err.source();
+                }
+            }
+        }
+    }
 
     /// v2 插件子索引（JS/QuickJS 插件）的裁剪样本——字段形态取自
     /// https://index.ximei.me/plugins/v2/index.yaml。

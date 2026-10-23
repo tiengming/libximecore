@@ -93,6 +93,23 @@ pub const VK_OEM_2: u16 = 0xBF;
 pub const VK_OEM_5: u16 = 0xDC;
 pub const VK_OEM_3: u16 = 0xC0;
 
+// 小键盘：VK_NUMPAD0..9 是 0x60..=0x69，和 ASCII 小写字母区间**数值重叠**。
+pub const VK_NUMPAD0: u16 = 0x60;
+pub const VK_NUMPAD9: u16 = 0x69;
+pub const VK_MULTIPLY: u16 = 0x6A;
+pub const VK_ADD: u16 = 0x6B;
+pub const VK_SUBTRACT: u16 = 0x6D;
+pub const VK_DECIMAL: u16 = 0x6E;
+pub const VK_DIVIDE: u16 = 0x6F;
+
+// X11 小键盘 keysym（rime 的 key_binder 用 `KP_0`/`KP_Divide` 这些名字）。
+pub const XK_KP_0: i32 = 0xFFB0;
+pub const XK_KP_DECIMAL: i32 = 0xFFAE;
+pub const XK_KP_DIVIDE: i32 = 0xFFAF;
+pub const XK_KP_MULTIPLY: i32 = 0xFFAA;
+pub const XK_KP_ADD: i32 = 0xFFAB;
+pub const XK_KP_SUBTRACT: i32 = 0xFFAD;
+
 pub const XK_SEMICOLON: i32 = 0x3B;
 pub const XK_APOSTROPHE: i32 = 0x27;
 pub const XK_BRACKETLEFT: i32 = 0x5B;
@@ -106,9 +123,9 @@ pub const XK_BACKSLASH: i32 = 0x5C;
 pub const XK_GRAVE: i32 = 0x60;
 pub const XK_CAPS_LOCK: i32 = 65509;
 
-// 0x61..=0x7A（ASCII 小写字母）与 0x60..=0x69（VK 小键盘）区间有意重叠，
-// 字母分支在前优先命中，重叠是刻意安排。
-#[allow(clippy::match_overlapping_arm)]
+// 0x61..=0x7A 这段**不是**字母：字母的 VK 是 0x41..=0x5A（大写区），
+// 0x60..=0x69 是小键盘 0..9。之前把 0x61..=0x7A 当字母放在前面，导致
+// 小键盘 1 → 'a'、小键盘 /（0x6F，未覆盖）→ 'o' 这类错位（用户实测）。
 pub fn vk_to_xk(vk: u16) -> i32 {
     match vk {
         VK_BACK => XK_BACK_SPACE as i32,
@@ -137,10 +154,15 @@ pub fn vk_to_xk(vk: u16) -> i32 {
         VK_OEM_2 => XK_SLASH,
         VK_OEM_5 => XK_BACKSLASH,
         VK_OEM_3 => XK_GRAVE,
+        // 小键盘必须先于任何"数值区间"分支判断（见上面的注释）。
+        VK_NUMPAD0..=VK_NUMPAD9 => XK_KP_0 + (vk - VK_NUMPAD0) as i32,
+        VK_DECIMAL => XK_KP_DECIMAL,
+        VK_DIVIDE => XK_KP_DIVIDE,
+        VK_MULTIPLY => XK_KP_MULTIPLY,
+        VK_ADD => XK_KP_ADD,
+        VK_SUBTRACT => XK_KP_SUBTRACT,
         0x41..=0x5A => XK_A as i32 + (vk - 0x41) as i32,
-        0x61..=0x7A => XK_A as i32 + (vk - 0x61) as i32,
         0x30..=0x39 => XK_0 as i32 + (vk - 0x30) as i32,
-        0x60..=0x69 => XK_0 as i32 + (vk - 0x60) as i32,
         _ => vk as i32,
     }
 }
@@ -208,6 +230,30 @@ impl KeyEvent {
 mod tests {
     use super::*;
 
+    /// 小键盘不能落到字母/数字区间里（0x60..=0x69 与 ASCII 小写字母数值重叠）。
+    ///
+    /// 实测症状：小键盘 1 打出 `a`、小键盘 `/` 打出 `o`（后者连分支都没命中，
+    /// 走 `_ => vk` 变成了 ASCII 0x6F）。
+    #[test]
+    fn numpad_maps_to_kp_keysyms() {
+        assert_eq!(vk_to_xk(0x61), XK_KP_0 + 1); // VK_NUMPAD1
+        assert_eq!(vk_to_xk(0x69), XK_KP_0 + 9); // VK_NUMPAD9
+        assert_eq!(vk_to_xk(0x60), XK_KP_0); // VK_NUMPAD0
+        assert_eq!(vk_to_xk(0x6F), XK_KP_DIVIDE); // /
+        assert_eq!(vk_to_xk(0x6A), XK_KP_MULTIPLY); // *
+        assert_eq!(vk_to_xk(0x6B), XK_KP_ADD); // +
+        assert_eq!(vk_to_xk(0x6D), XK_KP_SUBTRACT); // -
+        assert_eq!(vk_to_xk(0x6E), XK_KP_DECIMAL); // .
+    }
+
+    /// 字母仍然按大写 VK 区（0x41..=0x5A）映射，主键盘不受影响。
+    #[test]
+    fn letters_still_map_from_uppercase_vk() {
+        assert_eq!(vk_to_xk(0x41), XK_A as i32); // 'A'
+        assert_eq!(vk_to_xk(0x5A), XK_A as i32 + 25); // 'Z'
+        assert_eq!(vk_to_xk(0x31), XK_1 as i32); // 主键盘 '1'
+    }
+
     #[test]
     fn test_keyevent_new() {
         let event = KeyEvent::new(XK_A, K_CONTROL_MASK);
@@ -262,11 +308,11 @@ mod tests {
         assert_eq!(XK_SPACE, librime_sys2::RimeKeyCode_XK_space);
     }
 
+    /// 字母只来自大写 VK 区；0x61 是**小键盘 1**，不是 'a'（见 `numpad_maps_to_kp_keysyms`）。
     #[test]
-    fn test_vk_to_xk_letters_lowercase() {
+    fn test_vk_to_xk_letters_uppercase_range() {
         assert_eq!(vk_to_xk(0x41), XK_A as i32);
         assert_eq!(vk_to_xk(0x5A), XK_A as i32 + 25);
-        assert_eq!(vk_to_xk(0x61), XK_A as i32);
     }
 
     #[test]
