@@ -389,61 +389,116 @@ const DEFAULT_LOG_FILTER: &str = concat!(
 );
 
 pub fn init_logging(component: &str) {
-    let log_dir = get_log_dir();
-    fs::create_dir_all(&log_dir).ok();
-
-    let file_appender = tracing_appender::rolling::never(&log_dir, format!("{}.log", component));
-
-    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-    if let Ok(mut g) = LOG_GUARD.lock() {
-        *g = Some(guard);
-    }
-
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(non_blocking)
-        .with_ansi(false)
-        .with_target(false)
-        .with_line_number(true)
-        .try_init()
-        .ok();
+    match build_file_writer(component) {
+        Some(writer) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_target(false)
+                .with_line_number(true)
+                .try_init()
+                .ok();
+        }
+        None => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .with_target(false)
+                .with_line_number(true)
+                .try_init()
+                .ok();
+        }
+    }
 }
 
 pub fn init_logging_with_console(component: &str) {
-    let log_dir = get_log_dir();
-    fs::create_dir_all(&log_dir).ok();
-
-    let file_appender = tracing_appender::rolling::never(&log_dir, format!("{}.log", component));
-
-    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-    if let Ok(mut g) = LOG_GUARD.lock() {
-        *g = Some(guard);
-    }
-
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER));
 
+    // 文件层是 Option：日志文件不可用时**降级**而不是 panic（见 build_file_writer）。
+    let file_layer = build_file_writer(component).map(|writer| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_ansi(false)
+            .with_target(false)
+            .with_line_number(true)
+    });
+
     tracing_subscriber::registry()
         .with(filter)
+        .with(file_layer)
         .with(
             tracing_subscriber::fmt::layer()
-                .with_writer(non_blocking)
-                .with_ansi(false)
-                .with_target(false)
-                .with_line_number(true),
-        )
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stdout)
+                .with_writer(std::io::stderr)
                 .with_ansi(true),
         )
         .try_init()
         .ok();
+}
+
+/// 建文件日志 writer：数据根 `logs/` 不可用时退到系统临时目录，仍失败则只输出 stderr。
+///
+/// 以前直接用 `rolling::never()`——它在建不出文件时会 **panic**（`RollingFileAppender::new`
+/// 内部 `expect`），于是一次权限/占用问题就让整个输入法起不来，而且 panic 发生在日志
+/// 初始化前，连原因都留不下。这里改成 `Builder::build()` + 回退 + stderr 说明：
+/// 日志是诊断设施，**不能成为宿主启动的前置条件**。
+fn build_file_writer(component: &str) -> Option<tracing_appender::non_blocking::NonBlocking> {
+    let primary = get_log_dir();
+    match open_log_appender(&primary, component) {
+        Ok(appender) => {
+            let (writer, guard) = tracing_appender::non_blocking(appender);
+            if let Ok(mut g) = LOG_GUARD.lock() {
+                *g = Some(guard);
+            }
+            Some(writer)
+        }
+        Err(e) => {
+            eprintln!(
+                "[logging] 无法在 {} 创建日志文件：{e}；尝试临时目录（pid={} user={:?} appdata={:?}）",
+                primary.display(),
+                std::process::id(),
+                std::env::var("USERNAME").ok(),
+                std::env::var("APPDATA").ok(),
+            );
+            let fallback = std::env::temp_dir()
+                .join(app_metadata().config_dir_name)
+                .join("logs");
+            match open_log_appender(&fallback, component) {
+                Ok(appender) => {
+                    let (writer, guard) = tracing_appender::non_blocking(appender);
+                    if let Ok(mut g) = LOG_GUARD.lock() {
+                        *g = Some(guard);
+                    }
+                    eprintln!("[logging] 日志改写到 {}", fallback.display());
+                    Some(writer)
+                }
+                Err(e2) => {
+                    eprintln!(
+                        "[logging] 临时目录 {} 也不可用：{e2}；日志只输出到 stderr",
+                        fallback.display()
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn open_log_appender(
+    dir: &std::path::Path,
+    component: &str,
+) -> Result<tracing_appender::rolling::RollingFileAppender, String> {
+    fs::create_dir_all(dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::NEVER)
+        .filename_prefix(format!("{component}.log"))
+        .build(dir)
+        .map_err(|e| e.to_string())
 }
 
 fn get_log_dir() -> PathBuf {
