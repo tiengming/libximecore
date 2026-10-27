@@ -1,6 +1,7 @@
 use crate::theme::ThemeColors;
 use iced::widget::{
-    button, container, row, stack, text, toggler, toggler::Status as TogglerStatus, Button,
+    button, container, opaque, row, stack, text, toggler, toggler::Status as TogglerStatus,
+    Button,
 };
 use iced::{border, Alignment, Background, Border, Color, Element, Length};
 
@@ -38,13 +39,24 @@ pub fn modal_dialog<'a, Message: 'a>(
     dialog: Option<Element<'a, Message>>,
     colors: &ThemeColors,
 ) -> Element<'a, Message> {
+    modal_dialog_sized(base, dialog, colors, 520.0, None)
+}
+
+/// 固定尺寸版本：导入弹窗内容多，避免随着状态文字/进度行变化而改变窗口大小。
+pub fn modal_dialog_sized<'a, Message: 'a>(
+    base: Element<'a, Message>,
+    dialog: Option<Element<'a, Message>>,
+    colors: &ThemeColors,
+    width: f32,
+    height: Option<f32>,
+) -> Element<'a, Message> {
     let Some(dialog) = dialog else {
         return base;
     };
     let colors = *colors;
-    let card = container(dialog)
-        .max_width(520)
-        .width(Length::Shrink)
+    let mut card = container(dialog)
+        .width(Length::Fixed(width))
+        .max_width(width)
         .padding(16)
         .style(move |_| container::Style {
             background: Some(Background::Color(colors.surface)),
@@ -56,8 +68,11 @@ pub fn modal_dialog<'a, Message: 'a>(
             },
             ..container::Style::default()
         });
-    stack![
-        base,
+    if let Some(height) = height {
+        card = card.height(Length::Fixed(height));
+    }
+    // opaque：遮罩必须吃掉鼠标事件，否则点击会穿透到下面的页面。
+    let overlay = opaque(
         container(card)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -66,9 +81,9 @@ pub fn modal_dialog<'a, Message: 'a>(
             .style(|_| container::Style {
                 background: Some(Background::Color(Color::BLACK.scale_alpha(0.4))),
                 ..container::Style::default()
-            })
-    ]
-    .into()
+            }),
+    );
+    stack![base, overlay].into()
 }
 
 // ---- container styles ----

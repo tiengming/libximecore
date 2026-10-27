@@ -38,6 +38,10 @@ use std::path::{Path, PathBuf};
 /// 内置方案包 id（对齐安卓 `SchemaManifestManager.BUILTIN_PACKAGE_ID`）。
 pub const BUILTIN_PACKAGE_ID: &str = "builtin";
 
+/// 用户手动放进 rime 目录、不属于任何已注册包的文件在 UI 里的归属。
+/// 只用于展示与「删除本地方案」，不参与默认注入。
+pub const LOCAL_PACKAGE_ID: &str = "local";
+
 /// 注册表文件名（数据根下）。
 pub const REGISTRY_FILE_NAME: &str = ".registry.yaml";
 
@@ -65,6 +69,8 @@ pub const PROTECTED_RELEASE_FILES: &[&str] = &[
 pub fn package_label(package_id: &str) -> String {
     if package_id == BUILTIN_PACKAGE_ID {
         "内置方案包".to_string()
+    } else if package_id == LOCAL_PACKAGE_ID {
+        "本地方案".to_string()
     } else {
         package_id.to_string()
     }
@@ -109,7 +115,16 @@ pub fn is_user_data_path(rel: &str) -> bool {
         return true;
     }
     let base = p.rsplit('/').next().unwrap_or("");
-    base.ends_with(".custom.yaml") || base == "installation.yaml" || base == "custom_phrase.txt"
+    base.ends_with(".custom.yaml")
+        || base == "installation.yaml"
+        || base == "custom_phrase.txt"
+        // 配置备份/编辑器临时文件：绝不能当成方案包文件（否则会被登记成 builtin）。
+        || base.contains(".custom.yaml.")
+        || base.ends_with(".bak")
+        || base.ends_with(".orig")
+        || base.ends_with(".tmp")
+        || base.ends_with(".swp")
+        || base.ends_with('~')
 }
 
 /// 是否可归入包清单（既非受保护、也非用户数据）。
@@ -216,6 +231,150 @@ impl SchemaManifest {
         self.data_root.join("market").join(BUILTIN_BACKUP_DIR_NAME)
     }
 
+    /// 用户显式「清理内置」后的标记文件：存在时 server 不再把 seed 复制/登记回
+    /// builtin。放在数据根而不是注册表里，避免和包清单格式耦合。
+    pub fn builtin_removed_marker(&self) -> PathBuf {
+        self.data_root.join(".builtin-removed")
+    }
+
+    pub fn is_builtin_removed(&self) -> bool {
+        self.builtin_removed_marker().is_file()
+    }
+
+    pub fn set_builtin_removed(&self, removed: bool) -> Result<(), String> {
+        let path = self.builtin_removed_marker();
+        if removed {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("创建数据目录失败 {}: {}", parent.display(), e))?;
+            }
+            std::fs::write(&path, b"1")
+                .map_err(|e| format!("写入 {} 失败: {}", path.display(), e))
+        } else {
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!("删除 {} 失败: {}", path.display(), e)),
+            }
+        }
+    }
+
+    /// 用安装包自带的 seed 目录重新界定 builtin，并把其余无主文件登记为 local。
+    ///
+    /// - 只认 seed 里存在且 rime 目录里也存在的文件；用户删掉的内置文件不会复活。
+    /// - seed 文件备份的是 **seed 原版**（不是用户改过的当前文件），便于恢复。
+    /// - 旧注册表里被误登记为 builtin 的用户文件转成 local，不删除原文件。
+    pub fn seed_builtin_from(&self, seed_dirs: &[PathBuf]) -> Result<usize, String> {
+        let mut seed: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for dir in seed_dirs {
+            if !dir.is_dir() {
+                continue;
+            }
+            for rel in collect_files_in(dir)? {
+                if !is_trackable_path(&rel) || seed.contains_key(&rel) {
+                    continue;
+                }
+                let path = dir.join(&rel);
+                seed.insert(rel, path);
+            }
+        }
+
+        let mut registry = self.load_registry();
+        // 只认安装包 seed：旧 builtin 里不是 seed 的文件（历史遗留/用户手放）
+        // 交给 local，不删原文件。
+        let mut entry = PackageEntry::default();
+        let mut added = 0usize;
+        for (rel, src) in &seed {
+            let dest = self.rime_dir.join(rel);
+            if !dest.is_file() {
+                continue;
+            }
+            let Some(hash) = sha256_file(&dest) else {
+                continue;
+            };
+            added += 1;
+            entry.files.push(rel.clone());
+            entry.sha256.insert(rel.clone(), hash);
+            self.copy_seed_to_backup(rel, src);
+        }
+        entry.files.sort();
+        entry.files.dedup();
+
+        // 备份只保留当前安装包 seed，保证「恢复内置」不会把用户手放方案带回来。
+        self.prune_builtin_backup(&seed.keys().cloned().collect::<BTreeSet<String>>());
+        if entry.files.is_empty() {
+            registry.remove(BUILTIN_PACKAGE_ID);
+        } else {
+            registry.insert(BUILTIN_PACKAGE_ID.to_string(), entry);
+        }
+        self.rebuild_local_in(&mut registry)?;
+        self.save_registry(&registry)?;
+        Ok(added)
+    }
+
+    /// 把 rime 目录里未被任何包声明的可跟踪文件登记为 `local`（只登记、不动文件）。
+    pub fn register_local_package(&self) -> Result<(), String> {
+        let mut registry = self.load_registry();
+        self.rebuild_local_in(&mut registry)?;
+        self.save_registry(&registry)
+    }
+
+    fn rebuild_local_in(&self, registry: &mut Registry) -> Result<(), String> {
+        let claimed: BTreeSet<String> = registry
+            .iter()
+            .filter(|(pkg, _)| pkg.as_str() != LOCAL_PACKAGE_ID)
+            .flat_map(|(_, entry)| entry.files.iter().cloned())
+            .collect();
+        let mut local = PackageEntry::default();
+        for rel in self.collect_files()? {
+            if !is_trackable_path(&rel) || claimed.contains(&rel) {
+                continue;
+            }
+            let path = self.rime_dir.join(&rel);
+            if !path.is_file() {
+                continue;
+            }
+            let Some(hash) = sha256_file(&path) else {
+                continue;
+            };
+            local.files.push(rel.clone());
+            local.sha256.insert(rel, hash);
+        }
+        local.files.sort();
+        local.files.dedup();
+        if local.files.is_empty() {
+            registry.remove(LOCAL_PACKAGE_ID);
+        } else {
+            registry.insert(LOCAL_PACKAGE_ID.to_string(), local);
+        }
+        Ok(())
+    }
+
+    fn copy_seed_to_backup(&self, rel: &str, src: &Path) {
+        let dest = self.builtin_backup_dir().join(rel);
+        if let Some(parent) = dest.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                return;
+            }
+        }
+        let _ = std::fs::copy(src, &dest);
+    }
+
+    fn prune_builtin_backup(&self, keep: &BTreeSet<String>) {
+        let backup = self.builtin_backup_dir();
+        let Ok(files) = collect_files_in(&backup) else {
+            return;
+        };
+        for rel in files {
+            if keep.contains(&rel) {
+                continue;
+            }
+            let path = backup.join(&rel);
+            let _ = std::fs::remove_file(&path);
+            self.prune_empty_dirs(path.parent());
+        }
+    }
+
     /// 读取注册表；文件缺失或损坏时返回空表（对齐安卓 `loadRegistry` 容错）。
     pub fn load_registry(&self) -> Registry {
         let path = self.registry_path();
@@ -278,53 +437,25 @@ impl SchemaManifest {
             .or_else(|| owners.first().cloned())
     }
 
-    /// 未登记的包内方案 id → 登记为内置方案包，并备份到 `market/builtin/`。
-    /// 返回本次新增的文件数（对齐安卓 `refreshBuiltinManifest`）。
+    /// 清理 builtin 里已消失/已不可跟踪的声明（**不再**把无主文件认领成 builtin）。
+    /// 真实登记由 server 启动时的 `seed_builtin_from()` 完成。
     pub fn refresh_builtin_package(&self) -> Result<usize, String> {
         let mut registry = self.load_registry();
-        let claimed: BTreeSet<String> = registry
-            .values()
-            .flat_map(|entry| entry.files.iter().cloned())
-            .collect();
-
         let mut entry = registry.remove(BUILTIN_PACKAGE_ID).unwrap_or_default();
-        // 清理已消失的文件声明（用户手工删过内置方案文件时注册表不会留幽灵条目）。
-        entry.files.retain(|rel| self.rime_dir.join(rel).is_file());
+        entry.files.retain(|rel| {
+            self.rime_dir.join(rel).is_file() && is_trackable_path(rel)
+        });
         entry
             .sha256
             .retain(|rel, _| entry.files.iter().any(|f| f == rel));
-
-        let mut added = 0usize;
-        for rel in self.collect_files()? {
-            if claimed.contains(&rel) || entry.claims(&rel) || !is_trackable_path(&rel) {
-                continue;
-            }
-            let path = self.rime_dir.join(&rel);
-            let Some(hash) = sha256_file(&path) else {
-                continue;
-            };
-            entry.sha256.insert(rel.clone(), hash);
-            entry.files.push(rel.clone());
-            self.backup_builtin_file(&rel);
-            added += 1;
-        }
-
-        if added > 0 {
-            entry.files.sort();
-            entry.files.dedup();
-            tracing::info!(
-                "builtin 方案包：登记 {} 个未归属文件（共 {} 个）",
-                added,
-                entry.files.len()
-            );
-        }
         if entry.is_empty() {
             registry.remove(BUILTIN_PACKAGE_ID);
         } else {
             registry.insert(BUILTIN_PACKAGE_ID.to_string(), entry);
         }
+        self.rebuild_local_in(&mut registry)?;
         self.save_registry(&registry)?;
-        Ok(added)
+        Ok(0)
     }
 
     /// 冲突检测（对齐安卓 `detectConflicts`）：目标文件已被其他包声明且内容不同即冲突；
@@ -522,18 +653,6 @@ impl SchemaManifest {
         collect_files_in(&self.builtin_backup_dir()).unwrap_or_default()
     }
 
-    fn backup_builtin_file(&self, rel: &str) {
-        let src = self.rime_dir.join(rel);
-        let dest = self.builtin_backup_dir().join(rel);
-        if let Some(parent) = dest.parent() {
-            if std::fs::create_dir_all(parent).is_err() {
-                return;
-            }
-        }
-        let _ = std::fs::copy(&src, &dest);
-    }
-
-    /// 删除已空目录（自底向上，止步于 rime 目录）。
     fn prune_empty_dirs(&self, dir: Option<&Path>) {
         let mut current = dir;
         while let Some(d) = current {
@@ -710,6 +829,11 @@ mod tests {
         hex::encode(Sha256::digest(content.as_bytes()))
     }
 
+    /// 测试里用 rime 目录本身当 seed（目录里写什么就视为随包内置的文件）。
+    fn seed_from_rime(m: &SchemaManifest) -> Result<usize, String> {
+        m.seed_builtin_from(&[m.rime_dir().to_path_buf()])
+    }
+
     /// 内置包登记：只收方案文件，用户数据与宿主自有配置不入清单，并留备份。
     #[test]
     fn refresh_builtin_tracks_scheme_files_and_skips_user_data() {
@@ -726,7 +850,7 @@ mod tests {
         write_file(&m, "wubi86.userdb/db.txt", "userdb");
         write_file(&m, "sync/abc/wubi86.userdb.txt", "sync");
 
-        let added = m.refresh_builtin_package().unwrap();
+        let added = seed_from_rime(&m).unwrap();
         assert_eq!(added, 3, "仅 3 个方案文件应归入内置包");
 
         let registry = m.load_registry();
@@ -752,11 +876,11 @@ mod tests {
         assert!(!backup.join("default.custom.yaml").exists());
 
         // 幂等：再刷新不新增
-        assert_eq!(m.refresh_builtin_package().unwrap(), 0);
+        assert_eq!(seed_from_rime(&m).unwrap(), 0);
 
         // 文件被手工删除后不再冒充内置方案文件
         std::fs::remove_file(m.rime_dir().join("lua/date_translator.lua")).unwrap();
-        m.refresh_builtin_package().unwrap();
+        seed_from_rime(&m).unwrap();
         let builtin = m
             .load_registry()
             .get(BUILTIN_PACKAGE_ID)
@@ -767,13 +891,89 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// seed 只把随包文件登记为 builtin；用户手放方案归 local，配置备份不入清单。
+    #[test]
+    fn seed_marks_user_schema_as_local_not_builtin() {
+        let (root, m) = fixture("seed_local");
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        std::fs::write(seed.join("builtin.schema.yaml"), "builtin").unwrap();
+        write_file(&m, "builtin.schema.yaml", "builtin");
+        write_file(&m, "my_own.schema.yaml", "user");
+        write_file(&m, "xime.custom.yaml.bak", "backup");
+
+        m.seed_builtin_from(&[seed]).unwrap();
+        let registry = m.load_registry();
+        let builtin = registry.get(BUILTIN_PACKAGE_ID).expect("builtin");
+        assert_eq!(builtin.files, vec!["builtin.schema.yaml".to_string()]);
+        let local = registry.get(LOCAL_PACKAGE_ID).expect("local");
+        assert_eq!(local.files, vec!["my_own.schema.yaml".to_string()]);
+        assert!(!local.claims("xime.custom.yaml.bak"));
+        assert!(
+            !m.builtin_backup_dir()
+                .join("xime.custom.yaml.bak")
+                .exists()
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 旧 builtin 里不是安装包 seed 的文件（历史遗留/用户手放）迁移到 local；
+    /// 只有 seed 留下当内置，且原文件不删。
+    #[test]
+    fn seed_resets_builtin_to_seed_and_locals_legacy() {
+        let (root, m) = fixture("migrate_local");
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        std::fs::write(seed.join("builtin.schema.yaml"), "builtin").unwrap();
+        write_file(&m, "builtin.schema.yaml", "builtin");
+        write_file(&m, "legacy.schema.yaml", "legacy");
+        std::fs::write(
+            m.registry_path(),
+            "builtin:\n  files:\n  - builtin.schema.yaml\n  - legacy.schema.yaml\n",
+        )
+        .unwrap();
+
+        m.seed_builtin_from(&[seed]).unwrap();
+        let registry = m.load_registry();
+        assert_eq!(
+            registry.get(BUILTIN_PACKAGE_ID).map(|e| e.files.clone()),
+            Some(vec!["builtin.schema.yaml".to_string()])
+        );
+        assert!(registry
+            .get(LOCAL_PACKAGE_ID)
+            .is_some_and(|e| e.claims("legacy.schema.yaml")));
+        assert!(m.rime_dir().join("legacy.schema.yaml").is_file());
+
+        // 迁移之后用户新放入的方案也归 local。
+        write_file(&m, "new_user.schema.yaml", "user");
+        m.register_local_package().unwrap();
+        assert!(m
+            .load_registry()
+            .get(LOCAL_PACKAGE_ID)
+            .is_some_and(|e| e.claims("new_user.schema.yaml")));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn builtin_removed_marker_roundtrip() {
+        let (root, m) = fixture("builtin_marker");
+        assert!(!m.is_builtin_removed());
+        m.set_builtin_removed(true).unwrap();
+        assert!(m.is_builtin_removed());
+        m.set_builtin_removed(false).unwrap();
+        assert!(!m.is_builtin_removed());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// 冲突检测：同内容共享放行，异内容（含内置包占用）判冲突。
     #[test]
     fn detect_conflicts_allows_shared_content_and_flags_builtin() {
         let (root, m) = fixture("conflicts");
         write_file(&m, "wubi86.schema.yaml", "builtin-version");
         write_file(&m, "shared.dict.yaml", "shared");
-        m.refresh_builtin_package().unwrap();
+        seed_from_rime(&m).unwrap();
 
         // 第三方包声明的 shared.dict.yaml 与内置包内容相同 → 共享依赖，放行
         let non_conflict = m.detect_conflicts(
@@ -923,7 +1123,7 @@ mod tests {
         let (root, m) = fixture("restore");
         write_file(&m, "wubi86.schema.yaml", "wubi86");
         write_file(&m, "lua/date_translator.lua", "lua");
-        m.refresh_builtin_package().unwrap();
+        seed_from_rime(&m).unwrap();
         assert_eq!(m.builtin_backup_files().len(), 2);
 
         let outcome = m.uninstall_package(BUILTIN_PACKAGE_ID).unwrap();
@@ -963,7 +1163,17 @@ mod tests {
         write_file(&m, "default.yaml", "host-config");
         write_file(&m, "wubi86.custom.yaml", "user-patch");
         write_file(&m, "wubi86.userdb/db.txt", "userdb");
-        assert_eq!(m.refresh_builtin_package().unwrap(), 3, "仅方案文件登记");
+        // seed 目录只放「随包内置」的三个文件；用户补丁/受保护文件不在其中。
+        let seed = root.join("seed");
+        std::fs::create_dir_all(seed.join("lua")).unwrap();
+        std::fs::write(seed.join("wubi86.schema.yaml"), "builtin-wubi86").unwrap();
+        std::fs::write(seed.join("wubi86.dict.yaml"), "builtin-dict").unwrap();
+        std::fs::write(seed.join("symbols.yaml"), "shared-symbols").unwrap();
+        assert_eq!(
+            m.seed_builtin_from(&[seed]).unwrap(),
+            3,
+            "仅 seed 里的方案文件登记"
+        );
 
         // 第三方包安装：自己的文件 + 与内置同内容的共享文件 symbols.yaml
         write_file(&m, "rime_ice.schema.yaml", "third-party");
@@ -1096,7 +1306,7 @@ mod tests {
         let (root, m) = fixture("owners");
         write_file(&m, "shared.dict.yaml", "shared");
         write_file(&m, "wubi86.schema.yaml", "builtin");
-        m.refresh_builtin_package().unwrap();
+        seed_from_rime(&m).unwrap();
         m.register_package(
             "rime-ice",
             &[("shared.dict.yaml".to_string(), hash_of("shared"))],

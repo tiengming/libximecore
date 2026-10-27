@@ -90,8 +90,16 @@ pub fn theme(state: &SettingsApp) -> Theme {
 }
 
 /// 后台任务结果轮询订阅。
-pub fn subscription(_state: &SettingsApp) -> Subscription<Message> {
-    iced::time::every(std::time::Duration::from_millis(250)).map(|_| Message::BackgroundPoll)
+pub fn subscription(state: &SettingsApp) -> Subscription<Message> {
+    let interval = if state.settings.schema_import.open && state.settings.schema_import.busy {
+        50
+    } else {
+        250
+    };
+    let tick = iced::time::every(std::time::Duration::from_millis(interval))
+        .map(|_| Message::BackgroundPoll);
+    let drops = iced::window::events().map(|(_, event)| Message::WindowEvent(event));
+    Subscription::batch([tick, drops])
 }
 
 pub fn update(state: &mut SettingsApp, message: Message) -> Task<Message> {
@@ -144,6 +152,61 @@ pub fn update(state: &mut SettingsApp, message: Message) -> Task<Message> {
         }
         Message::UninstallSchema(id) => {
             state.settings.uninstall_market_schema(&id);
+        }
+        Message::DeleteSchema(id) => {
+            state.settings.delete_market_package(&id);
+        }
+        Message::SchemaImportOpen => {
+            state.settings.schema_import.open_dialog();
+        }
+        Message::SchemaImportClose => {
+            state.settings.schema_import.close();
+        }
+        Message::SchemaImportPathChanged(value) => {
+            state.settings.schema_import.set_path(value);
+        }
+        Message::SchemaImportUrlChanged(value) => {
+            state.settings.schema_import.set_url(value);
+        }
+        Message::SchemaImportPackageIdChanged(value) => {
+            state.settings.schema_import.package_id = value;
+        }
+        Message::SchemaImportBrowse => {
+            state.settings.browse_import_file();
+        }
+        Message::SchemaImportClipboard => {
+            state.settings.paste_import_clipboard();
+        }
+        Message::SchemaImportStart => {
+            state.settings.start_schema_import();
+        }
+        Message::SchemaImportDropped(path) => {
+            if state.settings.schema_import.open {
+                state
+                    .settings
+                    .schema_import
+                    .set_path(path.display().to_string());
+            }
+        }
+        Message::WindowEvent(event) => {
+            if let iced::window::Event::FileDropped(path) = event {
+                if state.settings.schema_import.open {
+                    state
+                        .settings
+                        .schema_import
+                        .set_path(path.display().to_string());
+                }
+            }
+        }
+        Message::CleanBuiltinSchema => {
+            state.settings.market_schema.builtin_clean_confirm = true;
+        }
+        Message::ConfirmCleanBuiltin => {
+            state.settings.market_schema.builtin_clean_confirm = false;
+            state.settings.clean_builtin_schema();
+        }
+        Message::CancelCleanBuiltin => {
+            state.settings.market_schema.builtin_clean_confirm = false;
         }
         Message::ConfirmSchemaInstall => {
             state.settings.confirm_schema_install();
@@ -806,10 +869,16 @@ fn view_inner(state: &SettingsApp) -> Element<'_, Message> {
     .into();
 
     // 安装冲突确认弹窗（输入方案页 / 扩展商店安装入口共用；未确认前不动文件）。
-    crate::components::widgets::modal_dialog(
+    let conflict = pages::input_schema::conflict_dialog(&state.settings, colors);
+    if conflict.is_some() {
+        return crate::components::widgets::modal_dialog(page, conflict, colors);
+    }
+    crate::components::widgets::modal_dialog_sized(
         page,
-        pages::input_schema::conflict_dialog(&state.settings, colors),
+        pages::input_schema::import_dialog(&state.settings, colors),
         colors,
+        560.0,
+        Some(500.0),
     )
 }
 

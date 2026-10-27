@@ -1,11 +1,11 @@
 #[cfg(any(windows, feature = "dict-page"))]
 use crate::components::widgets::text_input_style;
 use crate::components::widgets::{
-    badge, button_danger, button_disabled, button_primary, card_style, semibold, text_button,
+    badge, button_danger, button_disabled, button_primary, button_secondary, card_style, semibold,
+    text_button,
 };
 use crate::state::{Message, SettingsState};
 use crate::theme::ThemeColors;
-#[cfg(any(windows, feature = "dict-page"))]
 use iced::widget::text_input;
 use iced::widget::{button, column, container, row, text, Space};
 use iced::{border, Alignment, Background, Border, Color, Element, Length};
@@ -28,6 +28,7 @@ pub fn view<'a>(settings: &'a SettingsState, colors: &'a ThemeColors) -> Element
         Space::new().width(Length::Fill),
         button_primary("部署方案", colors, Message::DeploySchemas),
         button_primary("打开数据目录", colors, Message::OpenUserDataDir),
+        button_secondary("导入方案", colors, Message::SchemaImportOpen),
     ]
     .align_y(Alignment::Center)
     .spacing(12);
@@ -160,6 +161,122 @@ pub fn conflict_dialog<'a>(
     Some(dialog.into())
 }
 
+/// 「导入本地方案」弹窗：拖放 / 本地路径 / 远程 URL / 剪贴板。
+pub fn import_dialog<'a>(
+    settings: &'a SettingsState,
+    colors: &'a ThemeColors,
+) -> Option<Element<'a, Message>> {
+    if !settings.schema_import.open {
+        return None;
+    }
+    let state = &settings.schema_import;
+    let colors = *colors;
+    let busy = state.busy;
+    let status = state
+        .message
+        .clone()
+        .unwrap_or_else(|| "支持 .zip / .tar.gz；拖入文件或填写一种来源".to_string());
+
+    let dialog = column![
+        text("导入方案")
+            .size(16)
+            .font(semibold())
+            .color(colors.foreground),
+        text("把方案包拖到窗口里，或填本地路径 / 远程 URL")
+            .size(13)
+            .color(colors.foreground_muted),
+        container(
+            text("拖入 .zip / .tar.gz 方案包")
+                .size(14)
+                .color(colors.foreground_muted)
+        )
+        .width(Length::Fill)
+        .padding(18)
+        .center_x(Length::Fill)
+        .style(move |_| card_style(&colors)),
+        text("本地文件").size(12).color(colors.foreground_muted),
+        row![
+            text_input("C:\\path\\to\\schema.zip", &state.path)
+                .on_input(Message::SchemaImportPathChanged)
+                .style(move |_t, s| text_input_style(&colors, s))
+                .width(Length::Fill),
+            if state.browsing {
+                button_disabled("浏览中…", &colors)
+            } else {
+                button_secondary("浏览", &colors, Message::SchemaImportBrowse).into()
+            },
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+        text("远程 URL").size(12).color(colors.foreground_muted),
+        text_input("https://example.com/schema.zip", &state.url)
+            .on_input(Message::SchemaImportUrlChanged)
+            .style(move |_t, s| text_input_style(&colors, s))
+            .width(Length::Fill),
+        row![
+            text_button("从剪贴板读取文件 / URL", &colors, Message::SchemaImportClipboard),
+            Space::new().width(Length::Fill),
+        ]
+        .spacing(6),
+        text("方案名称").size(12).color(colors.foreground_muted),
+        text_input("显示给用户的名称（可改）", &state.package_id)
+            .on_input(Message::SchemaImportPackageIdChanged)
+            .style(move |_t, s| text_input_style(&colors, s))
+            .width(Length::Fill),
+        {
+            let (label, progress_value) = match state.progress {
+                Some((done, total, bps)) if total > 0 => {
+                    let pct = (done as f32 / total as f32 * 100.0).clamp(0.0, 100.0);
+                    (
+                        format!(
+                            "{pct:.0}% · {} / {} · {}/s",
+                            format_bytes(done),
+                            format_bytes(total),
+                            format_bytes(bps)
+                        ),
+                        Some(done as f64 / total as f64),
+                    )
+                }
+                Some((done, 0, bps)) => (
+                    format!("已接收 {} · {}/s", format_bytes(done), format_bytes(bps)),
+                    None,
+                ),
+                Some(_) => (String::new(), None),
+                None if busy => ("正在准备…".to_string(), None),
+                None => (String::new(), None),
+            };
+            container(
+                column![
+                    progress_track(progress_value, state.tick, colors),
+                    text(label).size(12).color(colors.foreground_muted),
+                ]
+                .spacing(4)
+                .height(Length::Fixed(34.0)),
+            )
+        },
+        text(status).size(12).color(if state.message.is_some() {
+            colors.error
+        } else {
+            colors.foreground_muted
+        }),
+        row![
+            Space::new().width(Length::Fill),
+            text_button("取消", &colors, Message::SchemaImportClose),
+            if busy {
+                button_disabled("导入中…", &colors)
+            } else {
+                button_primary("导入并安装", &colors, Message::SchemaImportStart).into()
+            },
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(10)
+    .width(Length::Fill);
+
+    Some(dialog.into())
+}
+
 /// 分段标签：已安装 / 已下载 / 方案词表。
 fn tab_bar<'a>(active: usize, colors: &'a ThemeColors) -> Element<'a, Message> {
     let colors = *colors;
@@ -280,6 +397,15 @@ fn installed_tab<'a>(settings: &'a SettingsState, colors: &'a ThemeColors) -> El
     }
 
     // 内置方案包被卸载（隔离安装第三方方案）后可从备份一键还原。
+    if groups.iter().any(|(pkg, _)| pkg == BUILTIN_PACKAGE_ID) {
+        let cleaning = busy_id == Some(BUILTIN_PACKAGE_ID);
+        list = list.push(clean_card(
+            cleaning,
+            any_busy,
+            settings.market_schema.builtin_clean_confirm,
+            colors,
+        ));
+    }
     if settings.input_schema.builtin_restorable {
         let restoring = busy_id == Some(BUILTIN_PACKAGE_ID);
         list = list.push(restore_card(restoring, any_busy, colors));
@@ -296,26 +422,31 @@ fn installed_tab<'a>(settings: &'a SettingsState, colors: &'a ThemeColors) -> El
 fn group_order(package_id: &str) -> (u8, String) {
     if package_id == BUILTIN_PACKAGE_ID {
         (0, String::new())
+    } else if package_id == xime_config::schema_manifest::LOCAL_PACKAGE_ID {
+        (1, String::new())
     } else {
-        (1, package_id.to_string())
+        (2, package_id.to_string())
     }
 }
 
 /// 方案包分组标题（来源标注：内置方案包 / <包 id>）。
 fn group_header<'a>(package_id: &str, count: usize, colors: ThemeColors) -> Element<'a, Message> {
     let is_builtin = package_id == BUILTIN_PACKAGE_ID;
-    let label = if is_builtin {
-        "内置方案包".to_string()
-    } else {
-        package_id.to_string()
-    };
+    let is_local = package_id == xime_config::schema_manifest::LOCAL_PACKAGE_ID;
+    let label = xime_config::schema_manifest::package_label(package_id);
     let mut head = row![
         text(label)
             .size(13)
             .font(semibold())
             .color(colors.foreground_muted),
         badge(
-            if is_builtin { "内置" } else { "第三方" },
+            if is_builtin {
+                "内置"
+            } else if is_local {
+                "本地"
+            } else {
+                "第三方"
+            },
             colors.foreground_muted,
             colors.surface_variant,
         ),
@@ -457,6 +588,57 @@ fn restore_card<'a>(restoring: bool, any_busy: bool, colors: ThemeColors) -> Ele
     .into()
 }
 
+fn clean_card<'a>(
+    cleaning: bool,
+    any_busy: bool,
+    confirm: bool,
+    colors: ThemeColors,
+) -> Element<'a, Message> {
+    let status = if cleaning {
+        "正在删除内置方案文件并写「已清理」标记；重启不会自动注入…"
+    } else if confirm {
+        "确认清理？内置方案文件会被删除（备份保留，可随时恢复）"
+    } else {
+        "删除内置方案包文件（共享词典若被其他包声明会保留）；可从备份恢复"
+    };
+    let widgets: Vec<Element<'a, Message>> = if confirm {
+        vec![
+            text_button("取消", &colors, Message::CancelCleanBuiltin).into(),
+            button_danger("确认清理", &colors, Message::ConfirmCleanBuiltin).into(),
+        ]
+    } else {
+        let action = action_button("清理内置方案", "清理中…", true, cleaning, any_busy);
+        let action_widget: Element<'a, Message> = if action.enabled {
+            button_danger(action.label, &colors, Message::CleanBuiltinSchema).into()
+        } else {
+            button_disabled(action.label, &colors)
+        };
+        vec![action_widget]
+    };
+    let mut actions = row![].spacing(6).align_y(Alignment::Center);
+    for widget in widgets {
+        actions = actions.push(widget);
+    }
+    container(
+        row![
+            column![
+                text("内置方案包").size(14).color(colors.foreground),
+                text(status).size(13).color(colors.foreground_muted),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            actions,
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .padding(12),
+    )
+    .width(Length::Fill)
+    .style(move |_| card_style(&colors))
+    .into()
+}
+
 /// 已下载方案包列表。
 ///
 /// `busy_id` 是当前正在安装/卸载的方案包 id，`any_busy` 表示有任务在跑：
@@ -531,12 +713,19 @@ fn package_card<'a>(
     );
     let action_widget: Element<'a, Message> = if action.enabled {
         if action.danger {
-            button_danger(action.label, &colors, Message::UninstallSchema(sid)).into()
+            button_danger(action.label, &colors, Message::UninstallSchema(sid.clone())).into()
         } else {
-            button_primary(action.label, &colors, Message::InstallSchema(sid)).into()
+            button_primary(action.label, &colors, Message::InstallSchema(sid.clone())).into()
         }
     } else {
         button_disabled(action.label, &colors)
+    };
+    let delete_widget: Element<'a, Message> = if installed {
+        button_disabled("先卸载", &colors)
+    } else if busy_self || any_busy {
+        button_disabled("删除", &colors)
+    } else {
+        button_danger("删除", &colors, Message::DeleteSchema(sid.clone())).into()
     };
 
     let status = if busy_self {
@@ -562,6 +751,7 @@ fn package_card<'a>(
             .spacing(2)
             .width(Length::Fill),
             action_widget,
+            delete_widget,
         ]
         .spacing(8)
         .align_y(Alignment::Center)
@@ -775,6 +965,60 @@ fn schema_dict_tab<'a>(
     colors: &'a ThemeColors,
 ) -> Element<'a, Message> {
     installed_tab(settings, colors)
+}
+
+fn progress_track(progress: Option<f64>, tick: u32, colors: ThemeColors) -> Element<'static, Message> {
+    const TRACK_WIDTH: f32 = 520.0;
+    const TRACK_HEIGHT: f32 = 6.0;
+    let (segment, offset) = match progress {
+        Some(ratio) => (ratio.clamp(0.0, 1.0) as f32, 0.0),
+        None => {
+            // 总大小未知时用 22% 宽的扫描块来回移动，至少让用户看到「在动」。
+            let phase = (tick % 60) as f32 / 60.0;
+            let travel = 1.0 - 0.22;
+            (0.22, phase * travel)
+        }
+    };
+    let filled = (TRACK_WIDTH * segment).max(1.0);
+    let gap = TRACK_WIDTH * offset;
+    let track = row![
+        Space::new().width(Length::Fixed(gap)),
+        container(Space::new().width(Length::Fixed(filled)).height(Length::Fixed(TRACK_HEIGHT)))
+            .style(move |_| container::Style {
+                background: Some(Background::Color(colors.primary)),
+                border: Border {
+                    radius: border::radius(999.0),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            }),
+        Space::new().width(Length::Fill),
+    ]
+    .height(Length::Fixed(TRACK_HEIGHT));
+    container(track)
+        .width(Length::Fixed(TRACK_WIDTH))
+        .height(Length::Fixed(TRACK_HEIGHT))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(colors.surface_variant)),
+            border: Border {
+                radius: border::radius(999.0),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= KB * KB {
+        format!("{:.1} MB", b / (KB * KB))
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 #[cfg(test)]

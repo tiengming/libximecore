@@ -11,15 +11,17 @@ fn replace_schema_list(content: &str, new_list: &str) -> String {
     }
 
     let mut result = String::new();
-    let mut found = false;
+    let mut replaced = false;
+    let mut inserted_under_patch = false;
     let lines: Vec<&str> = content.lines().collect();
     let mut i = 0;
 
     while i < lines.len() {
         let line = lines[i];
 
+        // 已有 schema_list：整段替换。
         if line.trim() == "schema_list:" {
-            found = true;
+            replaced = true;
             i += 1;
             while i < lines.len()
                 && lines[i].trim_start().starts_with('-')
@@ -34,12 +36,27 @@ fn replace_schema_list(content: &str, new_list: &str) -> String {
             continue;
         }
 
+        // 没有 schema_list 时插到已有 patch 下面，不能再追加一个顶层 patch：
+        // YAML 出现重复 key 时 librime 只取第一个 patch，schema_list 会被静默丢掉，
+        // 表现为部署后没有 build、方案全显示「未启用」。
+        if !replaced && !inserted_under_patch && line.trim() == "patch:" {
+            result.push_str(line);
+            result.push('\n');
+            result.push_str("  schema_list:\n");
+            for item in new_list.lines() {
+                result.push_str(&format!("    {}\n", item.trim()));
+            }
+            inserted_under_patch = true;
+            i += 1;
+            continue;
+        }
+
         result.push_str(line);
         result.push('\n');
         i += 1;
     }
 
-    if !found {
+    if !replaced && !inserted_under_patch {
         result.push_str("\npatch:\n  schema_list:\n");
         for item in new_list.lines() {
             result.push_str(&format!("    {}\n", item.trim()));
@@ -306,6 +323,35 @@ fn extract_schema_name(content: &str, schema_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 已有 `patch.menu` 但没有 schema_list 时，schema_list 必须插进同一个 patch；
+    /// 不能再追加第二个顶层 `patch:`（重复 key 会让 rime 丢列表）。
+    #[test]
+    fn schema_list_inserted_into_existing_patch() {
+        let content = "# header\npatch:\n  menu:\n    page_size: 5\n";
+        let updated = replace_schema_list(content, "- schema: wubi86_pinyin");
+        assert_eq!(
+            updated.matches("\npatch:").count(),
+            1,
+            "不允许出现重复 patch: {updated}"
+        );
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&updated).unwrap();
+        let list = parsed
+            .get("patch")
+            .and_then(|patch| patch.get("schema_list"))
+            .and_then(|list| list.as_sequence())
+            .expect("schema_list 应可解析");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].get("schema").and_then(|v| v.as_str()), Some("wubi86_pinyin"));
+        assert_eq!(
+            parsed
+                .get("patch")
+                .and_then(|patch| patch.get("menu"))
+                .and_then(|menu| menu.get("page_size"))
+                .and_then(|v| v.as_i64()),
+            Some(5)
+        );
+    }
 
     /// `menu/page_size` 落盘：只改这一个键，其它 patch 原样保留；已一致时不重复写。
     #[test]

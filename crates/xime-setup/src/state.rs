@@ -5,7 +5,9 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-use xime_config::schema_manifest::{self, Registry, SchemaManifest, BUILTIN_PACKAGE_ID};
+use xime_config::schema_manifest::{
+    self, Registry, SchemaManifest, BUILTIN_PACKAGE_ID, LOCAL_PACKAGE_ID,
+};
 use xime_config::{
     deploy_all, get_data_dirs, ColorSchemeConfig, DarkMode, SchemaConfig, SchemaConfigManager,
     SchemaInfo, SchemaManager, XimeConfig,
@@ -19,6 +21,18 @@ static MODEL_YAML_RESULT: OnceLock<Mutex<Option<Result<String, String>>>> = Once
 static PLUGIN_TASK_RESULT: OnceLock<Mutex<Option<PluginTaskResult>>> = OnceLock::new();
 static PLUGIN_YAML_RESULT: OnceLock<Mutex<Option<Result<String, String>>>> = OnceLock::new();
 static DOWNLOAD_PROGRESS: OnceLock<Mutex<Option<(String, f32)>>> = OnceLock::new();
+
+/// 本地方案导入的后台准备结果（复制/下载完成后的包 id）。
+static SCHEMA_IMPORT_RESULT: OnceLock<Mutex<Option<Result<String, String>>>> = OnceLock::new();
+static SCHEMA_IMPORT_PROGRESS: OnceLock<Mutex<Option<(u64, u64, u64)>>> = OnceLock::new();
+
+fn schema_import_result() -> &'static Mutex<Option<Result<String, String>>> {
+    SCHEMA_IMPORT_RESULT.get_or_init(|| Mutex::new(None))
+}
+
+fn schema_import_progress() -> &'static Mutex<Option<(u64, u64, u64)>> {
+    SCHEMA_IMPORT_PROGRESS.get_or_init(|| Mutex::new(None))
+}
 
 /// 方案列表快照：安装/卸载后由后台线程重扫，UI 只做一次替换，不在消息循环里
 /// 逐 `*.schema.yaml` 读文件 + 解析（审计 P0「轮询里的 reload_schemas」）。
@@ -78,6 +92,8 @@ enum MarketTaskResult {
     DeleteDone(String),
     /// 内置方案包从 market/builtin/ 备份还原（文件数）。
     BuiltinRestored(usize),
+    /// 内置方案包清理完成（文件数）。
+    BuiltinCleaned(usize),
     Error(String),
 }
 
@@ -117,6 +133,13 @@ fn notify_deploy_toast(title: &str, body: &str) {
     }
 }
 
+/// 本地方案导入：浏览文件对话框结果（后台线程，避免大目录卡住 UI）。
+static SCHEMA_IMPORT_BROWSE: OnceLock<Mutex<Option<Option<std::path::PathBuf>>>> = OnceLock::new();
+
+fn schema_import_browse() -> &'static Mutex<Option<Option<std::path::PathBuf>>> {
+    SCHEMA_IMPORT_BROWSE.get_or_init(|| Mutex::new(None))
+}
+
 /// 后台：部署 → 通知宿主重载（重建会话）→ 再显式选中目标方案。
 ///
 /// 只在「目标方案还没有 build 产物」时走这条路：宿主的 `SelectSchema` 会拒绝
@@ -130,9 +153,15 @@ fn notify_deploy_toast(title: &str, body: &str) {
 fn start_deploy_then_select(schema_id: &str, schema_name: &str) -> bool {
     // 占住部署槽位：既避免与「部署方案」按钮并发部署，也顺手给出即时反馈。
     match deploy_result().lock() {
-        Ok(mut slot) if slot.is_none() => *slot = Some(Ok("正在部署…".to_string())),
+        Ok(mut slot) if slot.is_none() => {
+            *slot = Some(Ok("当前方案未部署，正在部署，请等待…".to_string()))
+        }
         _ => return false,
     }
+    notify_deploy_toast(
+        "方案切换",
+        &format!("「{schema_name}」尚未部署，正在部署，请等待…"),
+    );
 
     let id = schema_id.to_string();
     let name = schema_name.to_string();
@@ -142,11 +171,17 @@ fn start_deploy_then_select(schema_id: &str, schema_name: &str) -> bool {
             if !notify_daemon_reload() {
                 return Ok(format!("已部署「{name}」；服务器未运行，下次启动时生效"));
             }
-            if notify_select_schema(&id) {
-                Ok(format!("已切换到「{name}」"))
-            } else {
-                Err(format!("部署完成，但切换到「{name}」被服务器拒绝"))
+            // server 收到 ReloadConfig 后是异步重建会话的，立刻 SelectSchema 仍可能
+            // 被拒；给引擎几拍时间，避免把「还没准备好」误报成切换失败。
+            for attempt in 0..6 {
+                if notify_select_schema(&id) {
+                    return Ok(format!("已部署并切换到「{name}」"));
+                }
+                if attempt < 5 {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
             }
+            Err(format!("部署完成，但服务器仍未切换到「{name}」"))
         })();
         match &result {
             Ok(msg) => notify_deploy_toast("方案切换完成", msg),
@@ -538,6 +573,34 @@ pub enum Message {
     DownloadModel(String),
     /// 扩展商店：删除本地已下载的模型。
     DeleteModel(String),
+    /// 输入方案：删除本地已下载的方案包（已安装时必须先卸载）。
+    DeleteSchema(String),
+    /// 输入方案：打开「导入本地方案」弹窗。
+    SchemaImportOpen,
+    /// 输入方案：关闭导入弹窗。
+    SchemaImportClose,
+    /// 输入方案：导入弹窗本地路径输入。
+    SchemaImportPathChanged(String),
+    /// 输入方案：导入弹窗远程 URL 输入。
+    SchemaImportUrlChanged(String),
+    /// 输入方案：导入弹窗包 ID 输入。
+    SchemaImportPackageIdChanged(String),
+    /// 输入方案：浏览本地方案包。
+    SchemaImportBrowse,
+    /// 输入方案：从剪贴板读取文件/URL。
+    SchemaImportClipboard,
+    /// 输入方案：开始导入。
+    SchemaImportStart,
+    /// 输入方案：拖入文件。
+    SchemaImportDropped(std::path::PathBuf),
+    /// iced 窗口事件（只用于文件拖放）。
+    WindowEvent(iced::window::Event),
+    /// 输入方案：清理内置方案包（写 marker，server 不再注入 seed）。
+    CleanBuiltinSchema,
+    /// 输入方案：确认清理内置方案包。
+    ConfirmCleanBuiltin,
+    /// 输入方案：取消清理内置方案包。
+    CancelCleanBuiltin,
     /// 扩展商店：下载插件包。
     DownloadPlugin(String),
     /// 扩展商店：安装已下载的插件包。
@@ -830,6 +893,8 @@ pub struct SettingsState {
     pub system_theme: SystemTheme,
     pub schemas_loaded: bool,
     pub market_schema: MarketSchemaState,
+    /// 输入方案页「导入本地方案」弹窗状态。
+    pub schema_import: SchemaImportState,
     pub market_model: MarketModelState,
     pub market_plugin: MarketPluginState,
     /// 插件管理：等待确认卸载的插件 id（None=无）。
@@ -885,6 +950,7 @@ impl SettingsState {
             appearance: AppearanceState::default(),
             input_schema: InputSchemaState::default(),
             market_schema: MarketSchemaState::default(),
+            schema_import: SchemaImportState::default(),
             market_model: MarketModelState::default(),
             market_plugin: MarketPluginState::default(),
             plugin_uninstall_confirm: None,
@@ -1344,6 +1410,14 @@ impl SettingsState {
                     Some(format!("已还原 {n} 个内置方案文件，默认方案已启用"));
                 self.market_schema.install_message_since = Some(std::time::Instant::now());
             }
+            MarketTaskResult::BuiltinCleaned(n) => {
+                self.market_schema.installed_ids = self.get_installed_package_ids();
+                start_schema_reload_async();
+                self.market_schema.install_message = Some(format!(
+                    "已清理 {n} 个内置方案文件；可在「本地方案」或市场方案中继续使用"
+                ));
+                self.market_schema.install_message_since = Some(std::time::Instant::now());
+            }
             MarketTaskResult::Error(e) => {
                 self.market_schema.install_message = Some(e);
                 self.market_schema.install_message_since = Some(std::time::Instant::now());
@@ -1458,6 +1532,7 @@ impl SettingsState {
         self.poll_plugin_yaml();
         self.poll_market_task();
         self.poll_schema_reload();
+        self.poll_schema_import();
         self.poll_model_task();
         self.poll_plugin_task();
         self.poll_download_progress();
@@ -1945,6 +2020,8 @@ impl SettingsState {
                 return;
             }
             let result = (|| -> anyhow::Result<()> {
+                // 先确认新包本身可安装，再卸载旧方案；坏包不能把现有方案删光。
+                validate_package_archive(&sid)?;
                 for pkg in &conflict.packages {
                     do_uninstall(pkg, false)?;
                 }
@@ -1995,6 +2072,90 @@ impl SettingsState {
         }
     }
 
+    /// 清理内置方案包：删 builtin 文件、写「已清理」标记（server 重启不再注入
+    /// seed），并把启用列表里的内置方案 id 去掉。要求至少还有一个非内置方案可用。
+    pub fn clean_builtin_schema(&mut self) {
+        if self.market_schema.installing.is_some() || self.market_schema.downloading.is_some() {
+            return;
+        }
+        self.market_schema.installing = Some(BUILTIN_PACKAGE_ID.to_string());
+        self.market_schema.install_message = None;
+
+        std::thread::spawn(|| {
+            let result = (|| -> anyhow::Result<usize> {
+                let manifest = schema_manifest().map_err(|e| anyhow::anyhow!(e))?;
+                let manager = SchemaManager::new().map_err(|e| anyhow::anyhow!("{}", e))?;
+                let registry = manifest.load_registry();
+                let builtin_ids: Vec<String> = registry
+                    .get(BUILTIN_PACKAGE_ID)
+                    .map(|entry| {
+                        package_schema_ids(entry.files.iter().map(String::as_str), None)
+                    })
+                    .unwrap_or_default();
+                let local_ids: Vec<String> = registry
+                    .get(LOCAL_PACKAGE_ID)
+                    .map(|entry| {
+                        package_schema_ids(entry.files.iter().map(String::as_str), None)
+                    })
+                    .unwrap_or_default();
+                let mut remaining: Vec<String> = manager
+                    .get_schema_list()
+                    .into_iter()
+                    .map(|s| s.schema_id)
+                    .filter(|id| !builtin_ids.iter().any(|b| b == id))
+                    .collect();
+                if remaining.is_empty() {
+                    // 还原内置会把启用列表重置成只有 builtin；清理时用 registry 的
+                    // 本地方案再兜底一次。
+                    remaining = local_ids;
+                }
+                if remaining.is_empty() {
+                    anyhow::bail!(
+                        "没有其他可用方案：请先放入自己的方案（或安装市场方案）并启用，再清理内置"
+                    );
+                }
+
+                // 先把剩余方案写进启用列表并部署/切换，再删 builtin：
+                // 否则 server 的 active schema 还是即将被删掉的内置方案，redeploy
+                // 会失败并弹一条「部署失败」通知。
+                let target = remaining[0].clone();
+                let refs: Vec<&str> = remaining.iter().map(String::as_str).collect();
+                manager
+                    .set_schema_list(&refs)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                manager.save().map_err(|e| anyhow::anyhow!("{}", e))?;
+                deploy_all().map_err(|e| anyhow::anyhow!("部署失败: {}", e))?;
+                if !notify_select_schema(&target) {
+                    anyhow::bail!("切换到剩余方案「{target}」失败，内置方案未删除");
+                }
+
+                let outcome = manifest
+                    .uninstall_package(BUILTIN_PACKAGE_ID)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                manifest
+                    .set_builtin_removed(true)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+
+                notify_daemon_reload();
+                Ok(outcome.deleted_files)
+            })();
+            let task = match result {
+                Ok(n) => {
+                    notify_deploy_toast(
+                        "内置方案已清理",
+                        &format!("{n} 个内置方案文件已删除；重启输入法后不会自动注入"),
+                    );
+                    MarketTaskResult::BuiltinCleaned(n)
+                }
+                Err(e) => {
+                    notify_deploy_toast("内置方案清理失败", &e.to_string());
+                    MarketTaskResult::Error(e.to_string())
+                }
+            };
+            *market_task_result().lock().unwrap() = Some(task);
+        });
+    }
+
     /// 后台线程执行内置方案还原（无冲突或已确认卸载第三方包后）。
     fn start_builtin_restore(&mut self) {
         self.market_schema.installing = Some(BUILTIN_PACKAGE_ID.to_string());
@@ -2005,6 +2166,9 @@ impl SettingsState {
                 let manifest = schema_manifest().map_err(|e| anyhow::anyhow!(e))?;
                 let restored = manifest
                     .restore_builtin_package()
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                manifest
+                    .set_builtin_removed(false)
                     .map_err(|e| anyhow::anyhow!(e))?;
                 apply_restored_builtin_schema_list(&manifest)?;
                 deploy_all().map_err(|e| anyhow::anyhow!("部署失败: {}", e))?;
@@ -2050,12 +2214,141 @@ impl SettingsState {
         });
     }
 
-    pub fn delete_market_package(&mut self, schema_id: &str) {
-        // 与 delete_market_model 同型守卫：下载/安装中删包会让下载线程
+    /// 输入方案页「导入本地方案」：开始复制/下载到 market 缓存。
+    pub fn start_schema_import(&mut self) {
+        if self.schema_import.busy {
+            return;
+        }
+        let path = trim_import_input(&self.schema_import.path);
+        let url = trim_import_input(&self.schema_import.url);
+        let Some(id) = sanitize_package_id(&self.schema_import.package_id) else {
+            self.schema_import.message = Some("方案名称不能为空，也不能只由 . - 组成".into());
+            return;
+        };
+        if path.is_empty() == url.is_empty() {
+            self.schema_import.message =
+                Some("请只选择一种来源：本地文件路径或远程 URL".into());
+            return;
+        }
+        if market_dir().join(&id).exists()
+            || self.market_schema.installed_ids.iter().any(|x| x == &id)
+        {
+            self.schema_import.message =
+                Some(format!("方案名称「{id}」已存在，请改名或先卸载/删除"));
+            return;
+        }
+
+        self.schema_import.busy = true;
+        self.schema_import.message = None;
+        self.schema_import.progress = None;
+        *schema_import_progress().lock().unwrap() = None;
+        std::thread::spawn(move || {
+            let result = prepare_import(&path, &url, &id);
+            *schema_import_result().lock().unwrap() = Some(result);
+        });
+    }
+
+    /// 回收导入准备结果；准备成功后再走正常安装流程（含冲突确认）。
+    fn poll_schema_import(&mut self) -> bool {
+        let mut changed = false;
+        let picked = match schema_import_browse().lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(picked) = picked {
+            self.schema_import.browsing = false;
+            if let Some(path) = picked {
+                self.schema_import.set_path(path.display().to_string());
+            }
+            changed = true;
+        }
+        if self.schema_import.open && self.schema_import.busy {
+            self.schema_import.tick = self.schema_import.tick.wrapping_add(1);
+            changed = true;
+        }
+        let progress = match schema_import_progress().lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(progress) = progress {
+            self.schema_import.progress = Some(progress);
+            return true;
+        }
+        let result = match schema_import_result().lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        let Some(result) = result else {
+            return changed;
+        };
+        self.schema_import.busy = false;
+        self.schema_import.progress = None;
+        match result {
+            Ok(id) => {
+                self.schema_import.open = false;
+                if !self.market_schema.downloaded_ids.contains(&id) {
+                    self.market_schema.downloaded_ids.push(id.clone());
+                }
+                self.install_market_schema(&id);
+                self.schema_import.message = None;
+            }
+            Err(e) => self.schema_import.message = Some(e),
+        }
+        true
+    }
+
+    pub fn browse_import_file(&mut self) {
+        if self.schema_import.browsing {
+            return;
+        }
+        self.schema_import.browsing = true;
+        self.schema_import.message = None;
+        std::thread::spawn(|| {
+            #[cfg(windows)]
+            unsafe {
+                use windows::Win32::System::Com::{
+                    CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
+                };
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                let picked = rfd::FileDialog::new()
+                    .add_filter("输入方案包", &["zip", "tar.gz"])
+                    .pick_file();
+                *schema_import_browse().lock().unwrap() = Some(picked);
+                CoUninitialize();
+            }
+            #[cfg(not(windows))]
+            {
+                let picked = rfd::FileDialog::new()
+                    .add_filter("输入方案包", &["zip", "tar.gz"])
+                    .pick_file();
+                *schema_import_browse().lock().unwrap() = Some(picked);
+            }
+        });
+    }
+
+    pub fn paste_import_clipboard(&mut self) {
+        #[cfg(windows)]
+        if let Some(path) = clipboard_file_path() {
+            self.schema_import.set_path(path.display().to_string());
+            return;
+        }
+        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(text) if !text.trim().is_empty() => self.schema_import.set_clipboard_text(text),
+            _ => self.schema_import.message = Some("剪贴板里没有文件路径或 URL".into()),
+        }
+    }
+
+    pub fn delete_market_package(&mut self, schema_id: &str) {        // 与 delete_market_model 同型守卫：下载/安装中删包会让下载线程
         // 往已删目录回写残缺包、或让安装线程从被删目录读包。
         if self.market_schema.downloading.as_deref() == Some(schema_id)
             || self.market_schema.installing.as_deref() == Some(schema_id)
         {
+            return;
+        }
+        if self.market_schema.installed_ids.iter().any(|id| id == schema_id) {
+            self.market_schema.install_message =
+                Some("该方案包已安装，请先卸载再删除下载包".to_string());
+            self.market_schema.install_message_since = Some(std::time::Instant::now());
             return;
         }
         let sid = schema_id.to_string();
@@ -2198,6 +2491,174 @@ fn deployed_schema_ids_in(build_dir: &std::path::Path) -> Vec<String> {
 fn deployed_schema_ids() -> Vec<String> {
     let (_, user_data_dir) = get_data_dirs();
     deployed_schema_ids_in(&user_data_dir.join("build"))
+}
+
+fn trim_import_input(text: &str) -> String {
+    text.trim().trim_matches('"').trim().to_string()
+}
+
+fn archive_name_ok(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".zip") || lower.ends_with(".tar.gz")
+}
+
+fn sanitize_package_id(raw: &str) -> Option<String> {
+    let raw = trim_import_input(raw);
+    let lower = raw.to_ascii_lowercase();
+    let stem: &str = if lower.ends_with(".tar.gz") && raw.len() > 7 {
+        &raw[..raw.len() - 7]
+    } else if lower.ends_with(".zip") && raw.len() > 4 {
+        &raw[..raw.len() - 4]
+    } else {
+        raw.as_str()
+    };
+    let id: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let id = id.trim_matches(['.', '-', ' ']).to_string();
+    if id.is_empty() || id == "." || id == ".." {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+/// 自动推导一个面向用户的包名：`rime-ice` → `Rime Ice`，中文保持原样。
+fn humanize_default_id(id: &str) -> String {
+    id.split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => {
+                    let mut out = String::new();
+                    out.extend(first.to_uppercase());
+                    out.push_str(chars.as_str());
+                    out
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn package_id_from_path(path: &str) -> Option<String> {
+    let name = std::path::Path::new(path).file_name()?.to_string_lossy();
+    if !archive_name_ok(&name) {
+        return None;
+    }
+    sanitize_package_id(&name).map(|id| humanize_default_id(&id))
+}
+
+fn filename_from_url(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let name = path.rsplit('/').next().unwrap_or("");
+    if name.is_empty() || !archive_name_ok(name) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn package_id_from_url(url: &str) -> Option<String> {
+    filename_from_url(url).and_then(|name| {
+        sanitize_package_id(&name).map(|id| humanize_default_id(&id))
+    })
+}
+
+/// 把来源复制/下载到 `market/<id>/`；返回包 id，供正常安装流程使用。
+fn prepare_import(path: &str, url: &str, id: &str) -> Result<String, String> {
+    let dest_dir = market_dir().join(id);
+    if dest_dir.exists() {
+        return Err(format!("方案名称「{id}」已存在"));
+    }
+    std::fs::create_dir_all(&dest_dir).map_err(|e| format!("创建缓存目录失败: {e}"))?;
+
+    let result = (|| -> Result<(), String> {
+        let filename = if !path.is_empty() {
+            let source = std::path::Path::new(path);
+            if !source.is_file() {
+                return Err(format!("本地文件不存在: {path}"));
+            }
+            let name = source
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .ok_or_else(|| "无法识别文件名".to_string())?;
+            if !archive_name_ok(&name) {
+                return Err("只支持 .zip / .tar.gz 方案包".to_string());
+            }
+            let size = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
+            if size > 0 {
+                *schema_import_progress().lock().unwrap() = Some((0, size, 0));
+            }
+            std::fs::copy(source, dest_dir.join(&name))
+                .map_err(|e| format!("复制方案包失败: {e}"))?;
+            if size > 0 {
+                *schema_import_progress().lock().unwrap() = Some((size, size, 0));
+            }
+            name
+        } else {
+            let name = filename_from_url(url)
+                .ok_or_else(|| "URL 必须以 .zip / .tar.gz 结尾".to_string())?;
+            download_file_with_stats(url, &dest_dir.join(&name), None, |done, total, bps| {
+                *schema_import_progress().lock().unwrap() = Some((done, total, bps));
+            })
+            .map_err(|e| format!("下载失败: {e}"))?;
+            name
+        };
+        if !archive_name_ok(&filename) {
+            return Err("只支持 .zip / .tar.gz 方案包".to_string());
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        let _ = std::fs::remove_dir_all(&dest_dir);
+        return Err(e);
+    }
+    Ok(id.to_string())
+}
+
+#[cfg(windows)]
+fn clipboard_file_path() -> Option<std::path::PathBuf> {
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+
+    const CF_HDROP: u32 = 15;
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return None;
+        }
+        let handle = match GetClipboardData(CF_HDROP) {
+            Ok(handle) => handle,
+            Err(_) => {
+                let _ = CloseClipboard();
+                return None;
+            }
+        };
+        let hdrop = HDROP(handle.0);
+        let count = DragQueryFileW(hdrop, u32::MAX, None);
+        if count == 0 {
+            let _ = CloseClipboard();
+            return None;
+        }
+        let mut buf = [0u16; 1024];
+        let len = DragQueryFileW(hdrop, 0, Some(&mut buf));
+        let _ = CloseClipboard();
+        if len == 0 {
+            return None;
+        }
+        Some(std::path::PathBuf::from(String::from_utf16_lossy(
+            &buf[..(len as usize).min(buf.len())],
+        )))
+    }
 }
 
 /// 重扫方案列表（纯读盘，可在后台线程跑）。
@@ -4934,6 +5395,8 @@ pub struct MarketSchemaState {
     pub install_message_since: Option<std::time::Instant>,
     /// 待确认的安装冲突（None = 无冲突确认弹窗）。
     pub conflict_install: Option<SchemaInstallConflict>,
+    /// 「清理内置方案」二次确认（避免一键删掉内置文件）。
+    pub builtin_clean_confirm: bool,
     /// 扩展商店当前 Tab（0=方案, 1=模型）。
     pub store_tab: usize,
     /// 分类筛选（None=全部）。
@@ -4942,6 +5405,64 @@ pub struct MarketSchemaState {
     pub selected_versions: HashMap<String, String>,
     /// 索引更新时间。
     pub updated_at: String,
+}
+
+#[derive(Clone, Default)]
+pub struct SchemaImportState {
+    pub open: bool,
+    pub path: String,
+    pub url: String,
+    pub package_id: String,
+    pub busy: bool,
+    /// 原生文件选择框是否正在后台打开（大目录时不能阻塞 UI）。
+    pub browsing: bool,
+    pub message: Option<String>,
+    /// (已下载字节, 总字节[0=未知], 字节/秒)。
+    pub progress: Option<(u64, u64, u64)>,
+    /// 进度条动画帧（未知总大小时做往返扫描）。
+    pub tick: u32,
+}
+
+impl SchemaImportState {
+    pub fn open_dialog(&mut self) {
+        self.open = true;
+        self.message = None;
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+        self.busy = false;
+        self.message = None;
+    }
+
+    pub fn set_path(&mut self, path: String) {
+        let trimmed = trim_import_input(&path);
+        if let Some(id) = package_id_from_path(&trimmed) {
+            self.package_id = id;
+        }
+        self.path = trimmed;
+        self.url.clear();
+        self.message = None;
+    }
+
+    pub fn set_url(&mut self, url: String) {
+        let trimmed = trim_import_input(&url);
+        if let Some(id) = package_id_from_url(&trimmed) {
+            self.package_id = id;
+        }
+        self.url = trimmed;
+        self.path.clear();
+        self.message = None;
+    }
+
+    pub fn set_clipboard_text(&mut self, text: String) {
+        let trimmed = trim_import_input(&text);
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            self.set_url(trimmed);
+        } else {
+            self.set_path(trimmed);
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -5206,7 +5727,7 @@ fn schema_install_conflict(schema_id: &str) -> Result<SchemaInstallConflict, Str
     }
     let packages: Vec<String> = nonempty_packages(&registry)
         .into_iter()
-        .filter(|pkg| pkg != schema_id)
+        .filter(|pkg| pkg != schema_id && pkg != LOCAL_PACKAGE_ID)
         .collect();
     Ok(SchemaInstallConflict {
         schema_id: schema_id.to_string(),
@@ -5225,7 +5746,7 @@ fn schema_restore_conflict() -> Result<Vec<String>, String> {
     }
     Ok(nonempty_packages(&registry)
         .into_iter()
-        .filter(|pkg| pkg != BUILTIN_PACKAGE_ID)
+        .filter(|pkg| pkg != BUILTIN_PACKAGE_ID && pkg != LOCAL_PACKAGE_ID)
         .collect())
 }
 
@@ -5328,8 +5849,11 @@ fn do_uninstall(schema_id: &str, deploy: bool) -> anyhow::Result<()> {
         // 没有备份时走下方回退。
         let other_market_packages = nonempty_packages(&manifest.load_registry())
             .into_iter()
-            .any(|pkg| pkg != BUILTIN_PACKAGE_ID);
-        if !other_market_packages && manifest.restore_builtin_package().is_ok() {
+            .any(|pkg| pkg != BUILTIN_PACKAGE_ID && pkg != LOCAL_PACKAGE_ID);
+        if !manifest.is_builtin_removed()
+            && !other_market_packages
+            && manifest.restore_builtin_package().is_ok()
+        {
             let files = manifest
                 .load_registry()
                 .get(BUILTIN_PACKAGE_ID)
@@ -5469,6 +5993,20 @@ fn download_file(
     sha256: Option<&str>,
     on_progress: impl Fn(f64),
 ) -> anyhow::Result<()> {
+    download_file_with_stats(url, dest, sha256, |done, total, _bps| {
+        if total > 0 {
+            on_progress(done as f64 / total as f64);
+        }
+    })
+}
+
+/// 下载并回调 `(已下载字节, 总字节[0=未知], 字节/秒)`，供导入进度条使用。
+fn download_file_with_stats(
+    url: &str,
+    dest: &std::path::Path,
+    sha256: Option<&str>,
+    on_progress: impl Fn(u64, u64, u64),
+) -> anyhow::Result<()> {
     let mut response = http_client()
         .get(url)
         .send()
@@ -5496,6 +6034,8 @@ fn download_file(
     let result = (|| -> anyhow::Result<()> {
         let mut buf = [0u8; 8192];
         let mut done: u64 = 0;
+        let started = std::time::Instant::now();
+        let mut last_report = started;
         loop {
             let n = response
                 .read(&mut buf)
@@ -5510,10 +6050,15 @@ fn download_file(
                 .write_all(&buf[..n])
                 .map_err(|e| anyhow::anyhow!("写入文件失败: {}", e))?;
             done += n as u64;
-            if total > 0 {
-                on_progress(done as f64 / total as f64);
+            let now = std::time::Instant::now();
+            if now.duration_since(last_report).as_millis() >= 200 {
+                let elapsed = now.duration_since(started).as_secs_f64().max(0.001);
+                let bps = (done as f64 / elapsed) as u64;
+                on_progress(done, total, bps);
+                last_report = now;
             }
         }
+        on_progress(done, total, 0);
 
         if let (Some(h), Some(expected)) = (hasher, sha256) {
             let actual = hex::encode(h.finalize());
@@ -5538,6 +6083,74 @@ fn download_file(
     }
 }
 
+/// 常见方案包会多包一层同名目录（`pkg/pkg/*.schema.yaml`）；只有一层目录且
+/// 根下没有文件时，把那一层当归档根，避免安装时找不到顶层 `.schema.yaml`。
+fn unwrap_single_archive_dir(root: &std::path::Path) -> std::path::PathBuf {
+    let mut current = root.to_path_buf();
+    loop {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            return current;
+        };
+        let mut dirs = Vec::new();
+        let mut has_file = false;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if !entry.file_name().to_string_lossy().starts_with('.') {
+                has_file = true;
+            }
+        }
+        if has_file || dirs.len() != 1 {
+            if has_top_schema(&current) {
+                return current;
+            }
+            // 根下可能混了 README/__MACOSX 等多个目录：找第一个带顶层 schema 的子目录。
+            for dir in &dirs {
+                if has_top_schema(dir) {
+                    return dir.clone();
+                }
+            }
+            if let Some(found) = find_schema_dir(&dirs) {
+                return found;
+            }
+            return current;
+        }
+        current = dirs.remove(0);
+    }
+}
+
+fn has_top_schema(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                entry.file_name().to_string_lossy().ends_with(".schema.yaml")
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn find_schema_dir(dirs: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
+    for dir in dirs {
+        if has_top_schema(dir) {
+            return Some(dir.clone());
+        }
+        let children: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(found) = find_schema_dir(&children) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// 递归收集解压目录下全部文件（相对路径统一 `/` 分隔，对齐归档条目路径）。
 fn collect_release_files(
     root: &std::path::Path,
@@ -5557,6 +6170,54 @@ fn collect_release_files(
         }
     }
     Ok(())
+}
+
+/// 安装前预检：解压到临时目录，确认能找到顶层 `.schema.yaml`。
+/// 必须在卸载冲突包**之前**调用，避免坏包把现有方案删光。
+fn validate_package_archive(schema_id: &str) -> anyhow::Result<()> {
+    let cache_dir = market_dir().join(schema_id);
+    anyhow::ensure!(cache_dir.exists(), "未找到缓存的下载文件");
+    let archive = std::fs::read_dir(&cache_dir)?
+        .flatten()
+        .find(|e| {
+            let n = e.file_name();
+            let n = n.to_string_lossy();
+            n.ends_with(".zip") || n.ends_with(".tar.gz")
+        })
+        .ok_or_else(|| anyhow::anyhow!("未找到缓存的压缩包"))?
+        .path();
+
+    let temp_dir = std::env::temp_dir().join(format!(
+        "xime_validate_{}_{}",
+        std::process::id(),
+        schema_id
+    ));
+    if temp_dir.exists() {
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+    std::fs::create_dir_all(&temp_dir)?;
+
+    let result = (|| -> anyhow::Result<()> {
+        let name = archive.file_name().unwrap_or_default().to_string_lossy();
+        if name.ends_with(".zip") {
+            extract_zip(&archive, &temp_dir)?;
+        } else {
+            extract_tar_gz(&archive, &temp_dir)?;
+        }
+        let root = unwrap_single_archive_dir(&temp_dir);
+        let mut files = Vec::new();
+        collect_release_files(&root, &root, &mut files)?;
+        let has_schema = files
+            .iter()
+            .any(|(rel, _)| rel.ends_with(".schema.yaml") && !rel.contains('/'));
+        anyhow::ensure!(
+            has_schema,
+            "包内没有顶层 .schema.yaml，不是可安装的方案包（常见原因：压缩包多套了一层目录）"
+        );
+        Ok(())
+    })();
+    std::fs::remove_dir_all(&temp_dir).ok();
+    result
 }
 
 /// 从 market 包安装方案（对齐 Android installPackageFromMarketDir）：
@@ -5611,7 +6272,8 @@ fn do_install(schema_id: &str) -> anyhow::Result<()> {
     //    （default.yaml / xime.yaml / custom_phrase.txt 等）、部署产物（build/）、
     //    用户词典目录（*.userdb/）与其他平台前端配置。
     let mut release_files: Vec<(String, std::path::PathBuf)> = Vec::new();
-    if let Err(e) = collect_release_files(&temp_dir, &temp_dir, &mut release_files) {
+    let release_root = unwrap_single_archive_dir(&temp_dir);
+    if let Err(e) = collect_release_files(&release_root, &release_root, &mut release_files) {
         std::fs::remove_dir_all(&temp_dir).ok();
         return Err(e);
     }
@@ -5747,6 +6409,53 @@ fn extract_tar_gz(archive_path: &std::path::Path, dest: &std::path::Path) -> any
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_package_id_derives_and_sanitizes() {
+        assert_eq!(
+            sanitize_package_id("rime-ice.zip").as_deref(),
+            Some("rime-ice")
+        );
+        assert_eq!(
+            sanitize_package_id("wubi86.tar.gz").as_deref(),
+            Some("wubi86")
+        );
+        assert_eq!(
+            sanitize_package_id("my scheme!.zip").as_deref(),
+            Some("my scheme")
+        );
+        assert_eq!(sanitize_package_id("../evil.zip").as_deref(), Some("evil"));
+        assert_eq!(sanitize_package_id("..."), None);
+        assert_eq!(
+            package_id_from_path("C:\\x\\rime-ice.zip").as_deref(),
+            Some("Rime Ice")
+        );
+        assert_eq!(
+            package_id_from_url("https://example.com/a/rime-ice.zip?x=1").as_deref(),
+            Some("Rime Ice")
+        );
+        assert_eq!(package_id_from_url("https://example.com/a/readme.txt"), None);
+    }
+
+    #[test]
+    fn import_only_accepts_archives() {
+        assert!(archive_name_ok("a.zip"));
+        assert!(archive_name_ok("a.tar.gz"));
+        assert!(!archive_name_ok("a.rar"));
+        assert!(!archive_name_ok("a.zip.tmp"));
+    }
+
+    #[test]
+    fn archive_single_top_dir_is_unwrapped() {
+        let base = std::env::temp_dir().join(format!("xime_archive_root_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let nested = base.join("rime-ice").join("rime-ice");
+        std::fs::create_dir_all(&nested).ok();
+        std::fs::write(nested.join("rime_ice.schema.yaml"), "schema").ok();
+        let root = unwrap_single_archive_dir(&base);
+        assert_eq!(root, nested);
+        std::fs::remove_dir_all(&base).ok();
+    }
 
     /// 手动跑（`--ignored --nocapture`）：复现商店「获取索引失败」的真实原因。
     ///
