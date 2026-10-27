@@ -763,40 +763,9 @@ fn package_card<'a>(
     .into()
 }
 
-/// 扫描本地市场缓存目录中的已下载方案包（跳过隐藏目录与内置方案备份目录）。
+/// 扫描本地市场缓存目录中的已下载方案包（与商店共用同一判定）。
 fn scan_market_dir() -> Vec<String> {
-    // 与扩展商店下载共用同一目录（state::market_dir，%APPDATA%\<name>\market\）。
-    let market_dir = crate::state::market_dir();
-
-    let mut pkg_ids = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&market_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') || name_str == BUILTIN_PACKAGE_ID {
-                continue;
-            }
-            if entry.path().is_dir() {
-                let has_archive = std::fs::read_dir(entry.path())
-                    .map(|mut e| {
-                        e.any(|e| {
-                            e.ok()
-                                .and_then(|e| {
-                                    e.file_name()
-                                        .to_str()
-                                        .map(|n| n.ends_with(".zip") || n.ends_with(".tar.gz"))
-                                })
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false);
-                if has_archive {
-                    pkg_ids.push(name_str.to_string());
-                }
-            }
-        }
-    }
-    pkg_ids
+    crate::state::downloaded_schema_ids()
 }
 
 /// 「方案词表」tab：只读浏览当前方案的码表词条（主表 + import_tables 合并）。

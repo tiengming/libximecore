@@ -2437,12 +2437,49 @@ impl SettingsState {
     }
 
     fn get_cached_schema_ids(&self) -> Vec<String> {
-        scan_dir_ids(&market_dir())
+        downloaded_schema_ids()
     }
 
     fn get_cached_model_ids(&self) -> Vec<String> {
         scan_dir_ids(&models_dir())
     }
+}
+
+/// 扫描 market 下**真正含压缩包**的已下载方案包。
+///
+/// 只按目录存在判断会把「下载失败/取消留下的空目录」也算成已下载：商店显示
+/// 「已下载」但已下载页因为过滤了空目录而完全没有卡片，用户也无处删除。
+pub(crate) fn downloaded_schema_ids() -> Vec<String> {
+    scan_downloaded_schema_ids(&market_dir())
+}
+
+fn scan_downloaded_schema_ids(dir: &std::path::Path) -> Vec<String> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut ids = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy().to_string();
+            if name.starts_with('.') || name == BUILTIN_PACKAGE_ID || !entry.path().is_dir() {
+                continue;
+            }
+            let has_archive = std::fs::read_dir(entry.path())
+                .map(|entries| {
+                    entries.flatten().any(|file| {
+                        let lower = file.file_name().to_string_lossy().to_ascii_lowercase();
+                        file.path().is_file()
+                            && (lower.ends_with(".zip") || lower.ends_with(".tar.gz"))
+                    })
+                })
+                .unwrap_or(false);
+            if has_archive {
+                ids.push(name);
+            }
+        }
+    }
+    ids
 }
 
 /// 扫描目录下的子目录名（跳过隐藏项），作为已下载/已缓存列表。
@@ -6409,6 +6446,22 @@ fn extract_tar_gz(archive_path: &std::path::Path, dest: &std::path::Path) -> any
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn downloaded_schema_ids_ignore_empty_placeholder_dirs() {
+        let dir = std::env::temp_dir().join(format!(
+            "xime_downloaded_ids_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("cangjie")).unwrap();
+        std::fs::create_dir_all(dir.join("quick")).unwrap();
+        std::fs::create_dir_all(dir.join("rime-ice")).unwrap();
+        std::fs::write(dir.join("rime-ice").join("rime-ice.zip"), "zip").unwrap();
+        let ids = scan_downloaded_schema_ids(&dir);
+        assert_eq!(ids, vec!["rime-ice".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn import_package_id_derives_and_sanitizes() {
