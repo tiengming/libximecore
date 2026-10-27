@@ -3,6 +3,7 @@ use serde::Deserialize;
 use sha2::Digest;
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use xime_config::schema_manifest::{self, Registry, SchemaManifest, BUILTIN_PACKAGE_ID};
 use xime_config::{
@@ -18,6 +19,22 @@ static MODEL_YAML_RESULT: OnceLock<Mutex<Option<Result<String, String>>>> = Once
 static PLUGIN_TASK_RESULT: OnceLock<Mutex<Option<PluginTaskResult>>> = OnceLock::new();
 static PLUGIN_YAML_RESULT: OnceLock<Mutex<Option<Result<String, String>>>> = OnceLock::new();
 static DOWNLOAD_PROGRESS: OnceLock<Mutex<Option<(String, f32)>>> = OnceLock::new();
+
+/// 方案列表快照：安装/卸载后由后台线程重扫，UI 只做一次替换，不在消息循环里
+/// 逐 `*.schema.yaml` 读文件 + 解析（审计 P0「轮询里的 reload_schemas」）。
+struct SchemaSnapshot {
+    schemas: Vec<SchemaInfo>,
+    packages: Vec<String>,
+    builtin_restorable: bool,
+    deployed: Vec<String>,
+}
+
+static SCHEMA_SNAPSHOT: OnceLock<Mutex<Option<SchemaSnapshot>>> = OnceLock::new();
+static SCHEMA_RELOADING: AtomicBool = AtomicBool::new(false);
+
+fn schema_snapshot() -> &'static Mutex<Option<SchemaSnapshot>> {
+    SCHEMA_SNAPSHOT.get_or_init(|| Mutex::new(None))
+}
 
 fn market_task_result() -> &'static Mutex<Option<MarketTaskResult>> {
     MARKET_TASK_RESULT.get_or_init(|| Mutex::new(None))
@@ -938,55 +955,44 @@ impl SettingsState {
         self.reload_schemas();
     }
 
-    /// 强制重载方案列表（安装/卸载方案后调用；load_schemas 有幂等挡板，
-    /// 不会刷新）。同时按方案包清单标注每个方案的来源（内置方案包 / 市场包 id），
-    /// 供「已安装」列表按包分组展示——第三方方案不再与内置方案混为一谈。
+    /// 强制重载方案列表（启动时用；安装/卸载后的刷新走后台快照）。
     pub fn reload_schemas(&mut self) {
-        if let Ok(manager) = SchemaManager::new() {
-            let schemas = manager.get_schema_list();
-            let mut packages = vec![BUILTIN_PACKAGE_ID.to_string(); schemas.len()];
-            if let Ok(manifest) = schema_manifest() {
-                let mut registry = manifest.load_registry();
-                // 注册表里还没有内置方案包（首次运行 / 从未安装过市场包）：
-                // 把 rime 目录里的无主方案文件登记为内置方案包。
-                if !registry.contains_key(BUILTIN_PACKAGE_ID) {
-                    let _ = manifest.refresh_builtin_package();
-                    registry = manifest.load_registry();
-                }
-                for (i, schema) in schemas.iter().enumerate() {
-                    let rel = format!("{}.schema.yaml", schema.schema_id);
-                    if let Some(pkg) = SchemaManifest::package_of(&registry, &rel) {
-                        packages[i] = pkg;
-                    }
-                }
-                // 内置方案可一键还原的判定：market/builtin/ 备份存在，且当前
-                // builtin 条目里没有任何方案文件——包括被卸载（注册表无条目）和
-                // 只剩无主共享词典的残缺条目（卸载最后一个第三方包后未还原，
-                // 残条目不能挡住恢复默认的入口）。
-                let builtin_has_schema = registry
-                    .get(BUILTIN_PACKAGE_ID)
-                    .map(|entry| entry.files.iter().any(|f| f.ends_with(".schema.yaml")))
-                    .unwrap_or(false);
-                self.input_schema.builtin_restorable =
-                    !builtin_has_schema && !manifest.builtin_backup_files().is_empty();
+        self.apply_schema_snapshot(load_schema_snapshot());
+    }
+
+    fn apply_schema_snapshot(&mut self, snapshot: SchemaSnapshot) {
+        self.input_schema.available_schemas = snapshot.schemas;
+        // 「当前方案」是**下标**，而列表按显示名排序（Emoji 这类 ASCII 名永远排最前）。
+        // 首次加载/重载时按服务端实际方案反查一次；查不到（服务没起/回调未注册）
+        // 才保留原下标，绝不让「当前」标记与引擎各说各话。
+        if let Some(current) = notify_current_schema() {
+            if let Some(index) = self
+                .input_schema
+                .available_schemas
+                .iter()
+                .position(|s| s.schema_id == current)
+            {
+                self.input_schema.selected_schema = index;
             }
-            self.input_schema.available_schemas = schemas;
-            // 「当前方案」是**下标**，而列表按显示名排序（Emoji 这类 ASCII 名永远排最前）。
-            // 首次加载/重载时按服务端实际方案反查一次；查不到（服务没起/回调未注册）
-            // 才保留原下标，绝不让「当前」标记与引擎各说各话。
-            if let Some(current) = notify_current_schema() {
-                if let Some(index) = self
-                    .input_schema
-                    .available_schemas
-                    .iter()
-                    .position(|s| s.schema_id == current)
-                {
-                    self.input_schema.selected_schema = index;
-                }
+        }
+        self.input_schema.schema_packages = snapshot.packages;
+        self.input_schema.builtin_restorable = snapshot.builtin_restorable;
+        self.input_schema.deployed_schema_ids = snapshot.deployed;
+        self.schemas_loaded = true;
+    }
+
+    /// 回收后台方案快照（安装/卸载/还原完成后的下一次轮询）。
+    fn poll_schema_reload(&mut self) -> bool {
+        let snapshot = match schema_snapshot().lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        match snapshot {
+            Some(snapshot) => {
+                self.apply_schema_snapshot(snapshot);
+                true
             }
-            self.input_schema.schema_packages = packages;
-            self.input_schema.deployed_schema_ids = deployed_schema_ids();
-            self.schemas_loaded = true;
+            None => false,
         }
     }
 
@@ -1322,18 +1328,18 @@ impl SettingsState {
                 // 已安装包列表按注册表重建（安装/卸载后的归属即事实源），
                 // 已安装方案列表立即刷新（此前只在启动时加载一次，装完不变）。
                 self.market_schema.installed_ids = self.get_installed_package_ids();
-                self.reload_schemas();
+                start_schema_reload_async();
             }
             MarketTaskResult::UninstallDone => {
                 self.market_schema.installed_ids = self.get_installed_package_ids();
-                self.reload_schemas();
+                start_schema_reload_async();
             }
             MarketTaskResult::DeleteDone(id) => {
                 self.market_schema.downloaded_ids.retain(|i| i != &id);
             }
             MarketTaskResult::BuiltinRestored(n) => {
                 self.market_schema.installed_ids = self.get_installed_package_ids();
-                self.reload_schemas();
+                start_schema_reload_async();
                 self.market_schema.install_message =
                     Some(format!("已还原 {n} 个内置方案文件，默认方案已启用"));
                 self.market_schema.install_message_since = Some(std::time::Instant::now());
@@ -1451,6 +1457,7 @@ impl SettingsState {
         self.poll_model_yaml();
         self.poll_plugin_yaml();
         self.poll_market_task();
+        self.poll_schema_reload();
         self.poll_model_task();
         self.poll_plugin_task();
         self.poll_download_progress();
@@ -2191,6 +2198,64 @@ fn deployed_schema_ids_in(build_dir: &std::path::Path) -> Vec<String> {
 fn deployed_schema_ids() -> Vec<String> {
     let (_, user_data_dir) = get_data_dirs();
     deployed_schema_ids_in(&user_data_dir.join("build"))
+}
+
+/// 重扫方案列表（纯读盘，可在后台线程跑）。
+fn load_schema_snapshot() -> SchemaSnapshot {
+    let mut schemas = Vec::new();
+    let mut packages = Vec::new();
+    let mut builtin_restorable = false;
+
+    if let Ok(manager) = SchemaManager::new() {
+        schemas = manager.get_schema_list();
+        packages = vec![BUILTIN_PACKAGE_ID.to_string(); schemas.len()];
+        if let Ok(manifest) = schema_manifest() {
+            let mut registry = manifest.load_registry();
+            // 注册表里还没有内置方案包（首次运行 / 从未安装过市场包）：
+            // 把 rime 目录里的无主方案文件登记为内置方案包。
+            if !registry.contains_key(BUILTIN_PACKAGE_ID) {
+                let _ = manifest.refresh_builtin_package();
+                registry = manifest.load_registry();
+            }
+            for (i, schema) in schemas.iter().enumerate() {
+                let rel = format!("{}.schema.yaml", schema.schema_id);
+                if let Some(pkg) = SchemaManifest::package_of(&registry, &rel) {
+                    packages[i] = pkg;
+                }
+            }
+            // 内置方案可一键还原的判定：market/builtin/ 备份存在，且当前
+            // builtin 条目里没有任何方案文件——包括被卸载（注册表无条目）和
+            // 只剩无主共享词典的残缺条目。
+            let builtin_has_schema = registry
+                .get(BUILTIN_PACKAGE_ID)
+                .map(|entry| entry.files.iter().any(|f| f.ends_with(".schema.yaml")))
+                .unwrap_or(false);
+            builtin_restorable =
+                !builtin_has_schema && !manifest.builtin_backup_files().is_empty();
+        }
+    }
+
+    SchemaSnapshot {
+        schemas,
+        packages,
+        builtin_restorable,
+        deployed: deployed_schema_ids(),
+    }
+}
+
+/// 安装/卸载/还原完成后：后台重扫，UI 下一次 `poll_schema_reload` 一次性替换。
+fn start_schema_reload_async() {
+    if SCHEMA_RELOADING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let snapshot = load_schema_snapshot();
+        match schema_snapshot().lock() {
+            Ok(mut slot) => *slot = Some(snapshot),
+            Err(poisoned) => *poisoned.into_inner() = Some(snapshot),
+        }
+        SCHEMA_RELOADING.store(false, Ordering::Release);
+    });
 }
 
 /// 模型下载目录：~/.config/xime/models/<id>/。
@@ -5133,8 +5198,12 @@ fn nonempty_packages(registry: &Registry) -> Vec<String> {
 /// 先把无主方案文件登记为内置方案包，再取注册表里除自身外的全部方案包。
 fn schema_install_conflict(schema_id: &str) -> Result<SchemaInstallConflict, String> {
     let manifest = schema_manifest()?;
-    manifest.refresh_builtin_package()?;
-    let registry = manifest.load_registry();
+    // 注册表已有内置包时跳过递归扫描（审计 P0：预检是安装点击后的头几百毫秒）。
+    let mut registry = manifest.load_registry();
+    if !registry.contains_key(BUILTIN_PACKAGE_ID) {
+        manifest.refresh_builtin_package()?;
+        registry = manifest.load_registry();
+    }
     let packages: Vec<String> = nonempty_packages(&registry)
         .into_iter()
         .filter(|pkg| pkg != schema_id)
@@ -5149,8 +5218,11 @@ fn schema_install_conflict(schema_id: &str) -> Result<SchemaInstallConflict, Str
 /// 否则还原后又会变成「内置 + 第三方」混装。
 fn schema_restore_conflict() -> Result<Vec<String>, String> {
     let manifest = schema_manifest()?;
-    manifest.refresh_builtin_package()?;
-    let registry = manifest.load_registry();
+    let mut registry = manifest.load_registry();
+    if !registry.contains_key(BUILTIN_PACKAGE_ID) {
+        manifest.refresh_builtin_package()?;
+        registry = manifest.load_registry();
+    }
     Ok(nonempty_packages(&registry)
         .into_iter()
         .filter(|pkg| pkg != BUILTIN_PACKAGE_ID)
