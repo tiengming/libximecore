@@ -117,10 +117,10 @@ snow = "0.10"
 spake2 = "0.4"
 
 # 同步 crate 内部依赖
-xime-sync-domain = { git = "https://github.com/ximeiorg/libximep2p.git", rev = "b19ecdec2c0336669897cafe909541906024dc29" }
+xime-sync-domain = { git = "https://github.com/ximeiorg/libximep2p.git", rev = "ca07a02c73edcb56fefb4aaf7eda45d6c720a24f" }
 xime-sync-store = { path = "crates/xime-sync-store" }
 xime-sync-service = { path = "crates/xime-sync-service" }
 xime-sync-server = { path = "crates/xime-sync-server" }
 
 # 跨设备剪贴板 P2P 传输（与 xime-sync-domain 同仓）
-xime-p2p = { git = "https://github.com/ximeiorg/libximep2p.git", rev = "b19ecdec2c0336669897cafe909541906024dc29" }
+xime-p2p = { git = "https://github.com/ximeiorg/libximep2p.git", rev = "ca07a02c73edcb56fefb4aaf7eda45d6c720a24f" }
