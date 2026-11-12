@@ -6,8 +6,10 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use xime_config::schema_manifest::{
-    self, Registry, SchemaManifest, BUILTIN_PACKAGE_ID, LOCAL_PACKAGE_ID,
+    self, same_package_id, Registry, SchemaManifest, BUILTIN_PACKAGE_ID, LOCAL_PACKAGE_ID,
 };
+/// 供页面层判断两个 id 是否指向同一个方案包（忽略大小写/分隔符/版本尾巴）。
+pub use xime_config::schema_manifest::same_package_id as package_id_eq;
 use xime_config::{
     deploy_all, get_data_dirs, ColorSchemeConfig, DarkMode, SchemaConfig, SchemaConfigManager,
     SchemaInfo, SchemaManager, XimeConfig,
@@ -83,18 +85,52 @@ fn download_progress() -> &'static Mutex<Option<(String, f32)>> {
     DOWNLOAD_PROGRESS.get_or_init(|| Mutex::new(None))
 }
 
-enum MarketTaskResult {
+/// 后台任务结果附带的用户可见文案。
+///
+/// 页面提示与系统通知必须用同一份文案：以前「成功」只弹 toast、页面无痕，
+/// 「失败」只在页面闪 4 秒红字，导致同一件事在两个地方的表述不一致。
+/// 由后台线程构造一次，页面与通知共用。
+pub struct MarketNotice {
+    /// 系统通知标题（页面不显示标题，只显示正文）。
+    pub title: &'static str,
+    /// 页面提示与系统通知正文（同一句话）。
+    pub body: String,
+}
+
+impl MarketNotice {
+    pub fn new(title: &'static str, body: String) -> Self {
+        Self { title, body }
+    }
+
+    /// 失败文案：说清「发生了什么 / 为什么 / 下一步」。
+    pub fn failure(title: &'static str, subject: &str, reason: &str, next_step: &str) -> Self {
+        Self::new(
+            title,
+            format!("{subject}失败：{reason}。下一步：{next_step}"),
+        )
+    }
+}
+
+pub enum MarketTaskResult {
     DownloadDone(String),
-    /// 安装完成（已安装包列表按注册表重建，无需回传 id）。
-    InstallDone,
+    /// 安装完成（已安装包列表按注册表重建，无需回传 id）+ 统一文案。
+    InstallDone(MarketNotice),
     /// 卸载完成（同上）。
-    UninstallDone,
+    UninstallDone(MarketNotice),
     DeleteDone(String),
     /// 内置方案包从 market/builtin/ 备份还原（文件数）。
-    BuiltinRestored(usize),
+    BuiltinRestored(usize, MarketNotice),
     /// 内置方案包清理完成（文件数）。
-    BuiltinCleaned(usize),
-    Error(String),
+    BuiltinCleaned(usize, MarketNotice),
+    Error(MarketNotice),
+}
+
+/// 注入一条市场任务结果（诊断入口，供自动化验证脚本驱动 `poll_market_task`）。
+///
+/// 正常流程由后台线程写入，这里只是把同一条通道暴露出来，避免验证脚本
+/// 为了测「页面文案与通知同源」而复制一份业务逻辑。
+pub fn set_market_task_result(result: MarketTaskResult) {
+    *market_task_result().lock().unwrap() = Some(result);
 }
 
 enum ModelTaskResult {
@@ -553,6 +589,139 @@ pub(crate) fn market_dir() -> std::path::PathBuf {
             base.join(xime_config::app_metadata().config_dir_name)
                 .join("market")
         })
+}
+
+/// 市场索引里的方案 id 与显示名快照（索引加载后刷新）。
+///
+/// 用途：把历史遗留的缓存目录名（`Moqi Wan Flypymo`、`Moqi Wan Flypymo 1.2.0`）
+/// 归一到索引 id（`moqi_wan_flypymo`）。索引 id 才是注册表 key 与安装目录的
+/// 统一口径：拿目录名当 id 会导致「卸载时提示未安装」「装进另一个目录」。
+static MARKET_SCHEMA_INDEX: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+
+fn market_schema_index() -> &'static Mutex<Vec<(String, String)>> {
+    MARKET_SCHEMA_INDEX.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// 记录索引里的方案 id / 显示名（索引加载成功后调用）。
+///
+/// 也供自动化验证脚本注入索引快照（诊断入口）。
+pub fn set_market_schema_index(entries: Vec<(String, String)>) {
+    *market_schema_index().lock().unwrap() = entries;
+}
+
+/// 索引里是否存在这个 id（精确匹配）。
+#[allow(dead_code)]
+fn index_has_id(schema_id: &str) -> bool {
+    market_schema_index()
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(id, _)| id == schema_id)
+}
+
+/// 方案显示名：优先用索引里的 name，找不到就退回 id 本身。
+///
+/// 也供自动化验证脚本检查显示名映射（诊断入口）。
+pub fn market_schema_display_name(schema_id: &str) -> String {
+    let index = market_schema_index().lock().unwrap();
+    index
+        .iter()
+        .find(|(id, _)| id == schema_id)
+        .map(|(_, name)| name.clone())
+        .unwrap_or_else(|| schema_id.to_string())
+}
+
+/// 把任意写法的方案 id（索引 id / 历史目录名 / 压缩包名）归一到索引 id。
+///
+/// 找不到对应索引项时原样返回，调用方再按目录名兜底。
+///
+/// 也供自动化验证脚本检查 id 归一（诊断入口）。
+pub fn canonical_schema_id(raw: &str) -> String {
+    let index = market_schema_index().lock().unwrap();
+    if index.iter().any(|(id, _)| id == raw) {
+        return raw.to_string();
+    }
+    index
+        .iter()
+        .find(|(id, _)| same_package_id(id, raw))
+        .map(|(id, _)| id.clone())
+        .unwrap_or_else(|| raw.to_string())
+}
+
+/// 清掉 market 下残留的下载中间态文件（`*.part*`）。
+///
+/// 下载中断/被杀会留下 `x.zip.part.part.<pid>` 这类残片：既占磁盘，
+/// 又会让用户以为「已下载了一个坏包」。这里只删明确带 `.part` 的临时文件，
+/// 正式包（`.zip` / `.tar.gz`）一律不动。
+///
+/// 也供自动化验证脚本确认残片清理（诊断入口）。
+pub fn cleanup_stale_download_parts() {
+    let root = market_dir();
+    let Ok(dirs) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for dir in dirs.flatten() {
+        let path = dir.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name().to_string_lossy().to_string();
+            if name.contains(".part") && file.path().is_file() {
+                let _ = std::fs::remove_file(file.path());
+            }
+        }
+    }
+}
+
+/// 找到方案包在 market 下**真正的**缓存目录。
+///
+/// 新下载的包按索引 id 存目录，但老版本可能存成 `Moqi Wan Flypymo` 或
+/// `Moqi Wan Flypymo 1.2.0`；这里按归一化 id 与压缩包名双向匹配，
+/// 避免「界面看到包、却找不到文件」或「装到另一个目录」。
+///
+/// 也供自动化验证脚本确认缓存目录解析（诊断入口）。
+pub fn package_cache_dir(schema_id: &str) -> std::path::PathBuf {
+    let root = market_dir();
+    let direct = root.join(schema_id);
+    if direct.is_dir() {
+        return direct;
+    }
+    let canonical = canonical_schema_id(schema_id);
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            if same_package_id(&name, &canonical) {
+                return path;
+            }
+            // 目录名对不上时再看目录里的压缩包名（`moqi_wan_flypymo-1.2.0.zip`）。
+            if let Ok(files) = std::fs::read_dir(&path) {
+                for file in files.flatten() {
+                    let file_name = file.file_name().to_string_lossy().to_string();
+                    if !archive_name_ok(&file_name) {
+                        continue;
+                    }
+                    let stem = file_name
+                        .trim_end_matches(".tar.gz")
+                        .trim_end_matches(".zip");
+                    if same_package_id(stem, &canonical) {
+                        return path;
+                    }
+                }
+            }
+        }
+    }
+    direct
 }
 
 /// 设置应用的 UI 消息（iced）。
@@ -1402,8 +1571,19 @@ impl SettingsState {
         match result {
             Ok(text) => match serde_yaml::from_str::<SchemaIndex>(&text) {
                 Ok(index) => {
+                    // 先记录索引里的 id / 显示名：后面的「已下载」扫描要用它把
+                    // 历史目录名（如 `Moqi Wan Flypymo`）归一到索引 id。
+                    set_market_schema_index(
+                        index
+                            .schemas
+                            .iter()
+                            .map(|s| (s.id.clone(), s.name.clone()))
+                            .collect(),
+                    );
                     self.market_schema.installed_ids = self.get_installed_package_ids();
                     self.market_schema.downloaded_ids = self.get_cached_schema_ids();
+                    // 顺手清掉上次下载中断留下的 `.part` 残片。
+                    cleanup_stale_download_parts();
                     self.market_schema.schemas = index.schemas;
                     self.market_schema.updated_at = index.updated_at;
                     self.market_schema.loaded = true;
@@ -1432,41 +1612,49 @@ impl SettingsState {
             return false;
         };
         match result {
-            MarketTaskResult::DownloadDone(id) => {
-                if !self.market_schema.downloaded_ids.contains(&id) {
-                    self.market_schema.downloaded_ids.push(id);
-                }
+            MarketTaskResult::DownloadDone(_id) => {
+                // 重新扫描而不是直接塞 id：老版本的缓存目录名与索引 id 不一致，
+                // 直接塞会让商店页显示一个不存在的包名。
+                self.market_schema.downloaded_ids = self.get_cached_schema_ids();
             }
-            MarketTaskResult::InstallDone => {
+            MarketTaskResult::InstallDone(notice) => {
                 // 已安装包列表按注册表重建（安装/卸载后的归属即事实源），
                 // 已安装方案列表立即刷新（此前只在启动时加载一次，装完不变）。
                 self.market_schema.installed_ids = self.get_installed_package_ids();
                 start_schema_reload_async();
+                // 页面提示与系统通知用同一份文案，成功结果不再只出现在 toast 里。
+                notify_deploy_toast(notice.title, &notice.body);
+                self.market_schema.install_message = Some(notice.body);
+                self.market_schema.install_message_since = Some(std::time::Instant::now());
             }
-            MarketTaskResult::UninstallDone => {
+            MarketTaskResult::UninstallDone(notice) => {
                 self.market_schema.installed_ids = self.get_installed_package_ids();
                 start_schema_reload_async();
+                notify_deploy_toast(notice.title, &notice.body);
+                self.market_schema.install_message = Some(notice.body);
+                self.market_schema.install_message_since = Some(std::time::Instant::now());
             }
             MarketTaskResult::DeleteDone(id) => {
-                self.market_schema.downloaded_ids.retain(|i| i != &id);
+                // 删除的可能是历史目录名，与列表里的索引 id 写法不同，按归一化 id 比较。
+                self.market_schema.downloaded_ids.retain(|i| !same_package_id(i, &id));
             }
-            MarketTaskResult::BuiltinRestored(n) => {
+            MarketTaskResult::BuiltinRestored(_n, notice) => {
                 self.market_schema.installed_ids = self.get_installed_package_ids();
                 start_schema_reload_async();
-                self.market_schema.install_message =
-                    Some(format!("已还原 {n} 个内置方案文件，默认方案已启用"));
+                notify_deploy_toast(notice.title, &notice.body);
+                self.market_schema.install_message = Some(notice.body);
                 self.market_schema.install_message_since = Some(std::time::Instant::now());
             }
-            MarketTaskResult::BuiltinCleaned(n) => {
+            MarketTaskResult::BuiltinCleaned(_n, notice) => {
                 self.market_schema.installed_ids = self.get_installed_package_ids();
                 start_schema_reload_async();
-                self.market_schema.install_message = Some(format!(
-                    "已清理 {n} 个内置方案文件；可在「本地方案」或市场方案中继续使用"
-                ));
+                notify_deploy_toast(notice.title, &notice.body);
+                self.market_schema.install_message = Some(notice.body);
                 self.market_schema.install_message_since = Some(std::time::Instant::now());
             }
-            MarketTaskResult::Error(e) => {
-                self.market_schema.install_message = Some(e);
+            MarketTaskResult::Error(notice) => {
+                notify_deploy_toast(notice.title, &notice.body);
+                self.market_schema.install_message = Some(notice.body);
                 self.market_schema.install_message_since = Some(std::time::Instant::now());
             }
         }
@@ -1743,14 +1931,14 @@ impl SettingsState {
     }
 
     /// 扩展商店安装/卸载消息 4 秒后自动消失。
+    ///
+    /// 方案安装/卸载的结果**不自动消失**：用户往往要照着提示去「输入方案」页
+    /// 卸载冲突包或重试，4 秒后红字就没了，只剩系统通知，界面与通知就对不上
+    /// （对应 U-31）。方案消息在下一次安装/卸载动作开始时清空。
     fn expire_install_messages(&mut self) {
         let now = std::time::Instant::now();
         let expired = std::time::Duration::from_secs(4);
         for (msg, since) in [
-            (
-                &mut self.market_schema.install_message,
-                &mut self.market_schema.install_message_since,
-            ),
             (
                 &mut self.market_model.install_message,
                 &mut self.market_model.install_message_since,
@@ -1992,7 +2180,12 @@ impl SettingsState {
             let result = do_download(&schema);
             let task = match result {
                 Ok(()) => MarketTaskResult::DownloadDone(schema.id.clone()),
-                Err(e) => MarketTaskResult::Error(e.to_string()),
+                Err(e) => MarketTaskResult::Error(MarketNotice::failure(
+                    "方案下载失败",
+                    &format!("方案「{}」下载", schema.name),
+                    &e.to_string(),
+                    "请检查网络后重新下载；若反复失败，可在「输入方案」页确认磁盘空间",
+                )),
             };
             *market_task_result().lock().unwrap() = Some(task);
         });
@@ -2054,15 +2247,19 @@ impl SettingsState {
                 })();
                 let task = match result {
                     Ok(n) => {
-                        notify_deploy_toast(
+                        let notice = MarketNotice::new(
                             "内置方案已还原",
-                            &format!("已卸载第三方方案包，{n} 个内置方案文件已回到数据目录"),
+                            format!("已卸载第三方方案包，{n} 个内置方案文件已回到数据目录"),
                         );
-                        MarketTaskResult::BuiltinRestored(n)
+                        MarketTaskResult::BuiltinRestored(n, notice)
                     }
                     Err(e) => {
-                        notify_deploy_toast("内置方案还原失败", &e.to_string());
-                        MarketTaskResult::Error(e.to_string())
+                        MarketTaskResult::Error(MarketNotice::failure(
+                            "内置方案还原失败",
+                            "还原内置方案",
+                            &e.to_string(),
+                            "请确认数据目录可写后重试；若磁盘空间不足请先清理空间",
+                        ))
                     }
                 };
                 *market_task_result().lock().unwrap() = Some(task);
@@ -2078,15 +2275,19 @@ impl SettingsState {
             })();
             let task = match result {
                 Ok(()) => {
-                    notify_deploy_toast(
+                    let notice = MarketNotice::new(
                         "方案部署完成",
-                        &format!("{} 已启用（已先卸载冲突方案包，避免混装）", sid),
+                        format!("方案「{sid}」已启用（已先卸载冲突方案包，避免混装）"),
                     );
-                    MarketTaskResult::InstallDone
+                    MarketTaskResult::InstallDone(notice)
                 }
                 Err(e) => {
-                    notify_deploy_toast("方案部署失败", &format!("{sid}：{e}"));
-                    MarketTaskResult::Error(e.to_string())
+                    MarketTaskResult::Error(MarketNotice::failure(
+                        "方案部署失败",
+                        &format!("方案「{sid}」部署"),
+                        &e.to_string(),
+                        "请先在「输入方案」页卸载占用同一目录的其它方案包，再重新安装",
+                    ))
                 }
             };
             *market_task_result().lock().unwrap() = Some(task);
@@ -2190,15 +2391,19 @@ impl SettingsState {
             })();
             let task = match result {
                 Ok(n) => {
-                    notify_deploy_toast(
+                    let notice = MarketNotice::new(
                         "内置方案已清理",
-                        &format!("{n} 个内置方案文件已删除；重启输入法后不会自动注入"),
+                        format!("{n} 个内置方案文件已删除；重启输入法后不会自动注入"),
                     );
-                    MarketTaskResult::BuiltinCleaned(n)
+                    MarketTaskResult::BuiltinCleaned(n, notice)
                 }
                 Err(e) => {
-                    notify_deploy_toast("内置方案清理失败", &e.to_string());
-                    MarketTaskResult::Error(e.to_string())
+                    MarketTaskResult::Error(MarketNotice::failure(
+                        "内置方案清理失败",
+                        "清理内置方案",
+                        &e.to_string(),
+                        "请先安装或放入一个自己的方案并启用，再清理内置方案",
+                    ))
                 }
             };
             *market_task_result().lock().unwrap() = Some(task);
@@ -2226,15 +2431,19 @@ impl SettingsState {
             })();
             let task = match result {
                 Ok(n) => {
-                    notify_deploy_toast(
+                    let notice = MarketNotice::new(
                         "内置方案已还原",
-                        &format!("{n} 个内置方案文件已回到数据目录"),
+                        format!("{n} 个内置方案文件已回到数据目录"),
                     );
-                    MarketTaskResult::BuiltinRestored(n)
+                    MarketTaskResult::BuiltinRestored(n, notice)
                 }
                 Err(e) => {
-                    notify_deploy_toast("内置方案还原失败", &e.to_string());
-                    MarketTaskResult::Error(e.to_string())
+                    MarketTaskResult::Error(MarketNotice::failure(
+                        "内置方案还原失败",
+                        "还原内置方案",
+                        &e.to_string(),
+                        "请确认数据目录可写后重试；若磁盘空间不足请先清理空间",
+                    ))
                 }
             };
             *market_task_result().lock().unwrap() = Some(task);
@@ -2251,12 +2460,19 @@ impl SettingsState {
             let result = do_install(&sid);
             let task = match result {
                 Ok(()) => {
-                    notify_deploy_toast("方案部署完成", &format!("{sid} 已启用，可直接输入使用"));
-                    MarketTaskResult::InstallDone
+                    let notice = MarketNotice::new(
+                        "方案部署完成",
+                        format!("方案「{sid}」已启用，可直接输入使用"),
+                    );
+                    MarketTaskResult::InstallDone(notice)
                 }
                 Err(e) => {
-                    notify_deploy_toast("方案部署失败", &format!("{sid}：{e}"));
-                    MarketTaskResult::Error(e.to_string())
+                    MarketTaskResult::Error(MarketNotice::failure(
+                        "方案部署失败",
+                        &format!("方案「{sid}」部署"),
+                        &e.to_string(),
+                        "请先在「输入方案」页卸载占用同一目录的其它方案包，再重新安装",
+                    ))
                 }
             };
             *market_task_result().lock().unwrap() = Some(task);
@@ -2394,7 +2610,14 @@ impl SettingsState {
         {
             return;
         }
-        if self.market_schema.installed_ids.iter().any(|id| id == schema_id) {
+        // 已安装判断用归一化 id：注册表里记的是索引 id（moqi_wan_flypymo），
+        // 界面传来的可能是历史目录名（Moqi Wan Flypymo），直接比字符串会漏判。
+        if self
+            .market_schema
+            .installed_ids
+            .iter()
+            .any(|id| same_package_id(id, schema_id))
+        {
             self.market_schema.install_message =
                 Some("该方案包已安装，请先卸载再删除下载包".to_string());
             self.market_schema.install_message_since = Some(std::time::Instant::now());
@@ -2402,7 +2625,8 @@ impl SettingsState {
         }
         let sid = schema_id.to_string();
         std::thread::spawn(move || {
-            let pkg_dir = market_dir().join(&sid);
+            // 删的是包**真正的**缓存目录（老版本可能存成 `Moqi Wan Flypymo`）。
+            let pkg_dir = package_cache_dir(&sid);
             let _ = std::fs::remove_dir_all(&pkg_dir);
             let task = MarketTaskResult::DeleteDone(sid);
             *market_task_result().lock().unwrap() = Some(task);
@@ -2422,12 +2646,19 @@ impl SettingsState {
             let result = do_uninstall(&sid, true);
             let task = match result {
                 Ok(()) => {
-                    notify_deploy_toast("方案已卸载", &format!("{sid} 已移除并重新部署"));
-                    MarketTaskResult::UninstallDone
+                    let notice = MarketNotice::new(
+                        "方案已卸载",
+                        format!("方案「{sid}」已移除并重新部署"),
+                    );
+                    MarketTaskResult::UninstallDone(notice)
                 }
                 Err(e) => {
-                    notify_deploy_toast("方案卸载失败", &format!("{sid}：{e}"));
-                    MarketTaskResult::Error(e.to_string())
+                    MarketTaskResult::Error(MarketNotice::failure(
+                        "方案卸载失败",
+                        &format!("方案「{sid}」卸载"),
+                        &e.to_string(),
+                        "请刷新「输入方案」页后重试；若提示「未安装」，说明该方案包已被移除",
+                    ))
                 }
             };
             *market_task_result().lock().unwrap() = Some(task);
@@ -2498,7 +2729,11 @@ impl SettingsState {
 ///
 /// 只按目录存在判断会把「下载失败/取消留下的空目录」也算成已下载：商店显示
 /// 「已下载」但已下载页因为过滤了空目录而完全没有卡片，用户也无处删除。
-pub(crate) fn downloaded_schema_ids() -> Vec<String> {
+///
+/// 返回的是**规范 id**（索引 id），不是目录名：老版本可能把包存成
+/// `Moqi Wan Flypymo` 这类目录名，界面拿目录名去卸载会提示「未安装」。
+/// 也供自动化验证脚本确认「已下载列表用的是规范 id」（诊断入口）。
+pub fn downloaded_schema_ids() -> Vec<String> {
     scan_downloaded_schema_ids(&market_dir())
 }
 
@@ -2524,7 +2759,11 @@ fn scan_downloaded_schema_ids(dir: &std::path::Path) -> Vec<String> {
                 })
                 .unwrap_or(false);
             if has_archive {
-                ids.push(name);
+                // 目录名归一到索引 id；索引里没有这个包时退回目录名（本地导入包）。
+                let canonical = canonical_schema_id(&name);
+                if !ids.contains(&canonical) {
+                    ids.push(canonical);
+                }
             }
         }
     }
@@ -6575,8 +6814,14 @@ fn nonempty_packages(registry: &Registry) -> Vec<String> {
 }
 
 /// 安装前冲突预检（对齐安卓 `installPackage` 的「rime 目录已有其他方案」判定）：
-/// 先把无主方案文件登记为内置方案包，再取注册表里除自身外的全部方案包。
-fn schema_install_conflict(schema_id: &str) -> Result<SchemaInstallConflict, String> {
+/// 先把无主方案文件登记为内置方案包，再取注册表里除自身外的**其它第三方方案包**。
+///
+/// 内置方案包与本地方案都不算冲突方：内置方案包是宿主自带的基础文件，
+/// 卸掉它只会让用户失去默认方案；本地方案只是「用户自己放进 rime 目录、
+/// 没登记来源」的兜底记录。两者都排除后，安装冲突弹窗只会列出真正占用文件的
+/// 第三方方案包。
+/// 也供自动化验证脚本检查「冲突弹窗只列真正占用的第三方包」（诊断入口）。
+pub fn schema_install_conflict(schema_id: &str) -> Result<SchemaInstallConflict, String> {
     let manifest = schema_manifest()?;
     // 注册表已有内置包时跳过递归扫描（审计 P0：预检是安装点击后的头几百毫秒）。
     let mut registry = manifest.load_registry();
@@ -6586,7 +6831,11 @@ fn schema_install_conflict(schema_id: &str) -> Result<SchemaInstallConflict, Str
     }
     let packages: Vec<String> = nonempty_packages(&registry)
         .into_iter()
-        .filter(|pkg| pkg != schema_id && pkg != LOCAL_PACKAGE_ID)
+        .filter(|pkg| {
+            pkg != BUILTIN_PACKAGE_ID
+                && pkg != LOCAL_PACKAGE_ID
+                && !same_package_id(pkg, schema_id)
+        })
         .collect();
     Ok(SchemaInstallConflict {
         schema_id: schema_id.to_string(),
@@ -6880,13 +7129,17 @@ fn download_file_with_stats(
     // 先写 .part 临时文件、全部成功后再 rename：直写最终路径的话，任何
     // 中途失败都会留残缺文件在"已下载"位置（目录存在即被判为已下载，
     // 之后安装永远失败且用户无从自愈）。
-    let tmp = dest.with_extension(format!(
-        "{}part.{}",
-        dest.extension()
-            .map(|e| format!("{}.part", e.to_string_lossy()))
-            .unwrap_or_else(|| "part".to_string()),
-        std::process::id()
-    ));
+    //
+    // 临时名用 `<原文件名>.part.<pid>`：早前用 with_extension 拼出来的
+    // 是 `x.zip.part.part.<pid>`（扩展名被替换两次），残留文件看不出是
+    // 哪个包的下载中间态，也没法按原名清理。
+    let file_name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".to_string());
+    let tmp = dest.with_file_name(format!("{}.part.{}", file_name, std::process::id()));
+    // 清掉上次中断留下的临时文件（同一 pid 复用目录时会撞名）。
+    let _ = std::fs::remove_file(&tmp);
     let mut output =
         std::fs::File::create(&tmp).map_err(|e| anyhow::anyhow!("创建文件失败: {}", e))?;
 
@@ -7034,7 +7287,7 @@ fn collect_release_files(
 /// 安装前预检：解压到临时目录，确认能找到顶层 `.schema.yaml`。
 /// 必须在卸载冲突包**之前**调用，避免坏包把现有方案删光。
 fn validate_package_archive(schema_id: &str) -> anyhow::Result<()> {
-    let cache_dir = market_dir().join(schema_id);
+    let cache_dir = package_cache_dir(schema_id);
     anyhow::ensure!(cache_dir.exists(), "未找到缓存的下载文件");
     let archive = std::fs::read_dir(&cache_dir)?
         .flatten()
@@ -7084,7 +7337,7 @@ fn validate_package_archive(schema_id: &str) -> anyhow::Result<()> {
 /// （目标文件已被其他包/内置方案包占用且内容不同则拒绝）→ 写包清单
 /// （按包隔离，含内容哈希，卸载据此精确删文件、按 claimedBy 保护共享文件）。
 fn do_install(schema_id: &str) -> anyhow::Result<()> {
-    let cache_schema_dir = market_dir().join(schema_id);
+    let cache_schema_dir = package_cache_dir(schema_id);
     anyhow::ensure!(cache_schema_dir.exists(), "未找到缓存的下载文件");
 
     let archive = std::fs::read_dir(&cache_schema_dir)?
@@ -7330,6 +7583,63 @@ mod tests {
         let root = unwrap_single_archive_dir(&base);
         assert_eq!(root, nested);
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 回归：历史遗留的缓存目录名（`Moqi Wan Flypymo`、带版本尾巴的
+    /// `Moqi Wan Flypymo 1.2.0`）必须被归一到索引 id（`moqi_wan_flypymo`），
+    /// 否则界面点卸载会报「方案包未安装」。
+    ///
+    /// 索引快照是进程级全局状态，所以两种目录名放在同一个用例里断言，
+    /// 避免与其它用例并行改写索引造成竞态。
+    #[test]
+    fn downloaded_schema_ids_map_legacy_dir_names_to_index_id() {
+        set_market_schema_index(vec![(
+            "moqi_wan_flypymo".to_string(),
+            "墨琪万飞".to_string(),
+        )]);
+        let dir = std::env::temp_dir().join(format!(
+            "xime_legacy_dir_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        for legacy in ["Moqi Wan Flypymo", "Moqi Wan Flypymo 1.2.0"] {
+            std::fs::create_dir_all(dir.join(legacy)).unwrap();
+            std::fs::write(
+                dir.join(legacy).join("moqi_wan_flypymo-1.2.0.zip"),
+                "zip",
+            )
+            .unwrap();
+        }
+        let ids = scan_downloaded_schema_ids(&dir);
+        assert_eq!(ids, vec!["moqi_wan_flypymo".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+        // 复位全局索引，避免影响其它用例。
+        set_market_schema_index(Vec::new());
+    }
+
+    /// 回归：安装冲突预检不应把内置方案包与本地方案算作冲突方。
+    #[test]
+    fn install_conflict_ignores_builtin_and_local_packages() {
+        let mut registry = Registry::default();
+        let mut builtin = schema_manifest::PackageEntry::default();
+        builtin.files.push("wubi86.schema.yaml".to_string());
+        registry.insert(BUILTIN_PACKAGE_ID.to_string(), builtin);
+        let mut local = schema_manifest::PackageEntry::default();
+        local.files.push("README.md".to_string());
+        registry.insert(LOCAL_PACKAGE_ID.to_string(), local);
+        let mut other = schema_manifest::PackageEntry::default();
+        other.files.push("other.schema.yaml".to_string());
+        registry.insert("other_pkg".to_string(), other);
+
+        let packages: Vec<String> = nonempty_packages(&registry)
+            .into_iter()
+            .filter(|pkg| {
+                pkg != BUILTIN_PACKAGE_ID
+                    && pkg != LOCAL_PACKAGE_ID
+                    && !same_package_id(pkg, "other_pkg")
+            })
+            .collect();
+        assert!(packages.is_empty(), "自身包不该算冲突: {packages:?}");
     }
 
     /// 手动跑（`--ignored --nocapture`）：复现商店「获取索引失败」的真实原因。

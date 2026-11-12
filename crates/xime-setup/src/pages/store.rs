@@ -251,8 +251,16 @@ fn schema_card<'a>(
     store: &'a MarketSchemaState,
     colors: &'a ThemeColors,
 ) -> Element<'a, Message> {
-    let installed = store.installed_ids.contains(&schema.id);
-    let downloaded = store.downloaded_ids.contains(&schema.id);
+    // 已安装/已下载判定用归一化 id：注册表里记的可能是历史 key 或历史目录名，
+    // 与索引 id 直接比字符串会漏判（表现为「明明装了却显示未安装」）。
+    let installed = store
+        .installed_ids
+        .iter()
+        .any(|id| crate::state::package_id_eq(id, &schema.id));
+    let downloaded = store
+        .downloaded_ids
+        .iter()
+        .any(|id| crate::state::package_id_eq(id, &schema.id));
     let downloading = store.downloading.as_deref() == Some(schema.id.as_str());
     let installing = store.installing.as_deref() == Some(schema.id.as_str());
     let progress = if downloading {
@@ -389,15 +397,12 @@ fn schema_action<'a>(
         };
         button_disabled(label, &colors)
     } else if installed {
-        text("已安装")
-            .size(13)
-            .color(colors.foreground_muted)
-            .into()
+        // 已安装的方案必须能从商店页卸载：只显示「已安装」纯文本时，
+        // 用户想换方案只能去「输入方案」页找入口（U-31 同类问题）。
+        button_danger("卸载", &colors, Message::UninstallSchema(schema_id)).into()
     } else if downloaded {
-        text("已下载")
-            .size(13)
-            .color(colors.foreground_muted)
-            .into()
+        // 已下载但未安装：给出「安装」入口，否则用户只能再去「输入方案」页。
+        button_primary("安装", &colors, Message::InstallSchema(schema_id)).into()
     } else {
         button_primary("下载", &colors, Message::DownloadSchema(schema_id)).into()
     }
