@@ -895,6 +895,7 @@ pub enum Message {
     #[cfg(feature = "clipboard-page")]
     SyncModeChanged(usize),
     /// 勾选/取消一个同步通道（id 为 `"p2p"` 或插件 id）。
+    #[cfg(feature = "clipboard-page")]
     SyncChannelToggled(String),
     /// 剪贴板同步插件：选择插件。
     #[cfg(feature = "clipboard-page")]

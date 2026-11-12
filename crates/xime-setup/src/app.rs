@@ -799,6 +799,7 @@ pub fn update(state: &mut SettingsApp, message: Message) -> Task<Message> {
         Message::SyncChannelToggled(id) => {
             state.settings.sync_plugin.toggle_channel(&id);
         }
+        #[cfg(feature = "clipboard-page")]
         Message::SyncModeChanged(i) => {
             state
                 .settings
