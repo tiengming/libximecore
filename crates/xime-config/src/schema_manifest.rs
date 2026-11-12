@@ -76,6 +76,77 @@ pub fn package_label(package_id: &str) -> String {
     }
 }
 
+/// 方案包 id 归一化：忽略大小写与分隔符，并去掉版本号尾巴。
+///
+/// 同一个方案包在不同历史版本里出现过三种 id 写法：索引 id（`moqi_wan_flypymo`）、
+/// 人类可读名（`Moqi Wan Flypymo`）、以及带版本号的名字（`Moqi Wan Flypymo 1.2.0`）。
+/// 注册表只认 key，所以查表前先把 id 归一化，才能让「卸载」找到真正登记过的包。
+pub fn normalize_package_id(package_id: &str) -> String {
+    let mut out = String::new();
+    for token in package_id.split(['-', '_', ' ']) {
+        // 版本号尾巴（1.2.0 / v18）不是包身份的一部分，丢弃。
+        if is_version_token(token) {
+            continue;
+        }
+        for c in token.chars() {
+            if c.is_alphanumeric() {
+                out.extend(c.to_lowercase());
+            }
+        }
+    }
+    out
+}
+
+/// 是否是版本号片段（如 `1.2.0`、`v18`、`v18.1.4`）。
+///
+/// 只认两种形态：带小数点的纯数字（`1.2.0`、`v18.1.4`）与 `v` 前缀数字（`v18`）。
+/// `t9` 这种方案名里的数字不能当版本号丢掉。
+fn is_version_token(token: &str) -> bool {
+    let t = token.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let has_v_prefix = t.starts_with(['v', 'V']);
+    let body = t.strip_prefix(['v', 'V']).unwrap_or(t);
+    if body.is_empty() {
+        return false;
+    }
+    if !body.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return false;
+    }
+    if !body.chars().any(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    // 带 `v` 前缀时纯数字也算版本（`v18`）；不带前缀时必须带小数点，
+    // 免得把方案名里的数字（`t9`、`360`）当成版本号丢掉。
+    has_v_prefix || body.contains('.')
+}
+
+/// 两个 id 是否指向同一个方案包（忽略大小写、分隔符与版本号尾巴）。
+///
+/// 同一个包在索引、缓存目录、注册表里的写法可能不同：
+/// `moqi_wan_flypymo` / `Moqi Wan Flypymo` / `Moqi Wan Flypymo 1.2.0`。
+/// 比较前后端传来的 id 时必须用这个函数，否则会出现「明明装了却查不到」。
+pub fn same_package_id(a: &str, b: &str) -> bool {
+    let left = normalize_package_id(a);
+    !left.is_empty() && left == normalize_package_id(b)
+}
+
+/// 在注册表里按「精确 key → 归一化 id」两种方式查找包 key。
+pub fn resolve_package_key(registry: &Registry, package_id: &str) -> Option<String> {
+    if registry.contains_key(package_id) {
+        return Some(package_id.to_string());
+    }
+    let target = normalize_package_id(package_id);
+    if target.is_empty() {
+        return None;
+    }
+    registry
+        .keys()
+        .find(|key| normalize_package_id(key) == target)
+        .cloned()
+}
+
 /// 归档/清单里的相对路径规范化：反斜杠转 `/`，去 `./` 前缀。
 pub fn normalize_rel(rel: &str) -> String {
     rel.trim_start_matches("./")
@@ -411,9 +482,9 @@ impl SchemaManifest {
     }
 
     pub fn is_installed(&self, package_id: &str) -> bool {
-        self.load_registry()
-            .get(package_id)
-            .map(|e| !e.is_empty())
+        let registry = self.load_registry();
+        resolve_package_key(&registry, package_id)
+            .map(|key| registry.get(&key).map(|e| !e.is_empty()).unwrap_or(false))
             .unwrap_or(false)
     }
 
@@ -480,6 +551,13 @@ impl SchemaManifest {
                     self_claimed = true;
                     continue;
                 }
+                // 本地方案是「用户自己放进 rime 目录、没登记来源」的兜底包：
+                // 它只是记录文件现状，不代表用户主动占用。市场方案安装时允许覆盖
+                // 本地遗留文件（如 README.md / essay.txt），否则这些说明文件会
+                // 让任何市场方案都装不上，且用户在界面上也没法卸载「本地方案」。
+                if pkg == LOCAL_PACKAGE_ID {
+                    continue;
+                }
                 if existing.is_empty() {
                     existing = entry.hash_of(&rel).unwrap_or_default().to_string();
                 }
@@ -530,7 +608,11 @@ impl SchemaManifest {
     /// 逐文件检查 claimedBy，仍有其他包声明则保留；随后清理衍生产物。
     pub fn uninstall_package(&self, package_id: &str) -> Result<UninstallOutcome, String> {
         let mut registry = self.load_registry();
-        let Some(entry) = registry.remove(package_id) else {
+        // 注册表 key 可能是历史写法（`Moqi Wan Flypymo` / `Moqi Wan Flypymo 1.2.0`），
+        // 界面传进来的却是目录名或索引 id，先按归一化 id 找回真正的 key。
+        let key = resolve_package_key(&registry, package_id)
+            .ok_or_else(|| format!("方案包 {} 未安装", package_label(package_id)))?;
+        let Some(entry) = registry.remove(&key) else {
             return Err(format!("方案包 {} 未安装", package_label(package_id)));
         };
 
@@ -1351,5 +1433,95 @@ mod tests {
         assert!(is_protected_release_path("custom_phrase.txt"));
         assert!(is_user_data_path("themes/bg.png"));
         assert!(is_user_data_path("sync/abc/wubi86.userdb.txt"));
+    }
+
+    /// id 归一化：索引 id / 人类可读名 / 带版本号的名字指向同一个包。
+    #[test]
+    fn normalize_package_id_ignores_case_separator_and_version() {
+        assert_eq!(normalize_package_id("moqi_wan_flypymo"), "moqiwanflypymo");
+        assert_eq!(normalize_package_id("Moqi Wan Flypymo"), "moqiwanflypymo");
+        assert_eq!(
+            normalize_package_id("Moqi Wan Flypymo 1.2.0"),
+            "moqiwanflypymo"
+        );
+        assert_eq!(normalize_package_id("rime-wanxiang"), "rimewanxiang");
+        assert_eq!(normalize_package_id("rime-wanxiang v18"), "rimewanxiang");
+    }
+
+    /// 注册表查 key：先精确匹配，再按归一化 id 匹配历史写法。
+    #[test]
+    fn resolve_package_key_finds_legacy_ids() {
+        let mut registry = Registry::new();
+        registry.insert(
+            "Moqi Wan Flypymo".to_string(),
+            PackageEntry {
+                files: vec!["a.schema.yaml".to_string()],
+                sha256: BTreeMap::new(),
+            },
+        );
+        assert_eq!(
+            resolve_package_key(&registry, "Moqi Wan Flypymo"),
+            Some("Moqi Wan Flypymo".to_string())
+        );
+        assert_eq!(
+            resolve_package_key(&registry, "moqi_wan_flypymo"),
+            Some("Moqi Wan Flypymo".to_string())
+        );
+        assert_eq!(
+            resolve_package_key(&registry, "Moqi Wan Flypymo 1.2.0"),
+            Some("Moqi Wan Flypymo".to_string())
+        );
+        assert_eq!(resolve_package_key(&registry, "rime-ice"), None);
+    }
+
+    /// 本地方案不阻塞市场安装：遗留的 README.md 不应让方案装不上。
+    #[test]
+    fn local_package_does_not_block_market_install() {
+        let (root, m) = fixture("local_no_block");
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        std::fs::write(seed.join("builtin.schema.yaml"), "builtin").unwrap();
+        write_file(&m, "builtin.schema.yaml", "builtin");
+        write_file(&m, "README.md", "legacy");
+        write_file(&m, "essay.txt", "legacy");
+        m.seed_builtin_from(&[seed]).unwrap();
+
+        // README.md / essay.txt 未登记来源 ⇒ 归「本地方案」
+        let registry = m.load_registry();
+        assert!(registry.contains_key(LOCAL_PACKAGE_ID));
+
+        let conflicts = m.detect_conflicts(
+            "rime-wanxiang",
+            &[
+                ("README.md".to_string(), hash_of("market-readme")),
+                ("essay.txt".to_string(), hash_of("market-essay")),
+            ],
+        );
+        assert!(
+            conflicts.is_empty(),
+            "本地方案不应阻塞市场安装: {:?}",
+            conflicts
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 卸载：传历史写法也能找到注册表里真正登记的包。
+    #[test]
+    fn uninstall_resolves_legacy_package_id() {
+        let (root, m) = fixture("uninstall_legacy_id");
+        write_file(&m, "a.schema.yaml", "a");
+        m.register_package(
+            "Moqi Wan Flypymo",
+            &[("a.schema.yaml".to_string(), hash_of("a"))],
+        )
+        .unwrap();
+
+        let outcome = m.uninstall_package("moqi_wan_flypymo").unwrap();
+        assert_eq!(outcome.deleted_files, 1);
+        assert!(!m.rime_dir().join("a.schema.yaml").exists());
+        assert!(!m.load_registry().contains_key("Moqi Wan Flypymo"));
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
