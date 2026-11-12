@@ -194,9 +194,12 @@ mod imp {
         let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "密钥长度错误")?;
         let mut iv = [0u8; NONCE_LEN];
         getrandom::fill(&mut iv).map_err(|_| "随机数不可用")?;
+        // Nonce::from_slice 在 aes-gcm 0.11 已弃用：改用 copy_from_slice 填充。
+        let mut nonce = Nonce::default();
+        nonce.copy_from_slice(&iv);
         let ct = cipher
             .encrypt(
-                Nonce::from_slice(&iv),
+                &nonce,
                 Payload {
                     msg: plain.as_bytes(),
                     aad: &[],
@@ -225,8 +228,10 @@ mod imp {
         let (iv, ct) = blob.split_at(NONCE_LEN);
         let key = load_or_create_key(key_path)?;
         let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
+        let mut nonce = Nonce::default();
+        nonce.copy_from_slice(iv);
         let plain = cipher
-            .decrypt(Nonce::from_slice(iv), Payload { msg: ct, aad: &[] })
+            .decrypt(&nonce, Payload { msg: ct, aad: &[] })
             .ok()?;
         String::from_utf8(plain).ok()
     }
@@ -279,9 +284,12 @@ mod imp {
         let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "密钥长度错误")?;
         let mut iv = [0u8; NONCE_LEN];
         getrandom::fill(&mut iv).map_err(|_| "随机数不可用")?;
+        // Nonce::from_slice 在 aes-gcm 0.11 已弃用：改用 copy_from_slice 填充。
+        let mut nonce = Nonce::default();
+        nonce.copy_from_slice(&iv);
         let ct = cipher
             .encrypt(
-                Nonce::from_slice(&iv),
+                &nonce,
                 Payload {
                     msg: plain.as_bytes(),
                     aad: &[],
@@ -310,8 +318,10 @@ mod imp {
         let (iv, ct) = blob.split_at(NONCE_LEN);
         let key = load_or_create_key()?;
         let cipher = Aes256Gcm::new_from_slice(&key).ok()?;
+        let mut nonce = Nonce::default();
+        nonce.copy_from_slice(iv);
         let plain = cipher
-            .decrypt(Nonce::from_slice(iv), Payload { msg: ct, aad: &[] })
+            .decrypt(&nonce, Payload { msg: ct, aad: &[] })
             .ok()?;
         String::from_utf8(plain).ok()
     }
