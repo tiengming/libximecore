@@ -630,7 +630,11 @@ fn downloads_tab<'a>(
 
     let mut list = column![].spacing(8).width(Length::Fill);
     for pkg_id in &pkg_ids {
-        let installed = installed_ids.contains(pkg_id);
+        // 已安装判定用归一化 id：注册表记的是索引 id，界面传来的是规范化 id，
+        // 但历史目录名归一后仍可能与注册表写法有细微差别。
+        let installed = installed_ids
+            .iter()
+            .any(|id| crate::state::package_id_eq(id, pkg_id));
         // 本机已有其他方案包 → 安装需先经冲突确认（方案隔离）。
         let needs_isolation = !installed && !installed_ids.is_empty();
         let busy_self = busy_id == Some(pkg_id.as_str());
@@ -702,10 +706,17 @@ fn package_card<'a>(
         "已下载，未安装"
     };
 
+    let display_name = crate::state::market_schema_display_name(pkg_id);
+    let title = if display_name == pkg_id {
+        pkg_id.to_string()
+    } else {
+        format!("{}（{}）", display_name, pkg_id)
+    };
+
     container(
         row![
             column![
-                text(pkg_id.to_string()).size(14).color(colors.foreground),
+                text(title).size(14).color(colors.foreground),
                 text(status).size(13).color(colors.foreground_muted),
             ]
             .spacing(2)
