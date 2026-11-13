@@ -7285,6 +7285,57 @@ fn collect_release_files(
     Ok(())
 }
 
+/// 把方案包里的 `custom/<schema>.custom.yaml` 平铺到 rime 根目录。
+///
+/// librime 只在**方案同目录**（rime 根目录）找 `<schema>.custom.yaml`：
+/// `AutoPatchConfigPlugin` 生成的是 `PatchReference{<id>.custom, "patch", optional}`，
+/// 资源 id 由 `ToResourceId` 按所在目录拼出，子目录 `custom/` 下的同名文件
+/// 根本不会被读到。方案包（万象等）把补丁模板放在 `custom/` 子目录里，
+/// 用户改完那个文件再点「重新部署」不会有任何效果——这就是远程 #29 的现象。
+///
+/// 规则：
+/// - 只平铺**本包自带方案**的 `<schema>.custom.yaml`（不把包外的文件塞进根目录）；
+/// - 根目录已有同名文件时**不覆盖**（保护用户已经改过的内容）；
+/// - `custom/` 下的副本保留：万象的 lua 会把它当模板来源再复制一份到根目录。
+///
+/// 返回被平铺的文件名（相对 rime 根目录），供日志与测试使用。
+fn flatten_schema_custom_templates(
+    user_data_dir: &std::path::Path,
+    release_files: &[(String, std::path::PathBuf)],
+    schema_ids: &[String],
+) -> Vec<String> {
+    let mut flattened = Vec::new();
+    for (rel, src) in release_files {
+        let Some(rest) = rel.strip_prefix("custom/") else {
+            continue;
+        };
+        // 只认 custom/ 下的直接子文件，且必须是 <schema>.custom.yaml
+        let Some(base) = rest.strip_suffix(".custom.yaml") else {
+            continue;
+        };
+        if base.contains('/') {
+            continue;
+        }
+        if !schema_ids.iter().any(|id| id == base) {
+            continue;
+        }
+        let dest = user_data_dir.join(format!("{base}.custom.yaml"));
+        if dest.exists() {
+            // 用户已经改过（或来自更早的安装），不覆盖
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                continue;
+            }
+        }
+        if std::fs::copy(src, &dest).is_ok() {
+            flattened.push(format!("{base}.custom.yaml"));
+        }
+    }
+    flattened
+}
+
 /// 安装前预检：解压到临时目录，确认能找到顶层 `.schema.yaml`。
 /// 必须在卸载冲突包**之前**调用，避免坏包把现有方案删光。
 fn validate_package_archive(schema_id: &str) -> anyhow::Result<()> {
@@ -7446,6 +7497,14 @@ fn do_install(schema_id: &str) -> anyhow::Result<()> {
         std::fs::copy(src, &dest)?;
     }
     std::fs::remove_dir_all(&temp_dir).ok();
+
+    // 3.1) 把包里的 custom/<schema>.custom.yaml 平铺到 rime 根目录。
+    //      librime 只在方案同目录找 <schema>.custom.yaml，放在 custom/ 子目录
+    //      的那份永远不生效，用户改完重新部署也看不到变化（远程 #29）。
+    let flattened = flatten_schema_custom_templates(&user_data_dir, &release_files, &new_schema_ids);
+    if !flattened.is_empty() {
+        tracing::info!("已把方案补丁平铺到 rime 根目录：{}", flattened.join("、"));
+    }
 
     // 4) 写安装清单（按包隔离，含内容哈希：卸载据此精确删文件、按 claimedBy
     //    保护共享文件）。
@@ -7877,9 +7936,79 @@ schemas:
         assert_eq!(ids, ["a".to_string(), "b".to_string()]);
     }
 
-    /// 子目录里的 `.schema.yaml` 不算（rime 的 schema_list 只认顶层 id），重复项去重。
+    /// 回归：方案包把补丁模板放在 `custom/` 子目录时，必须平铺一份到 rime 根目录。
+    ///
+    /// 远程 #29 的现象就是「改 wanxiang.custom.yaml 重新部署无效果」——
+    /// librime 只在方案同目录找 `<schema>.custom.yaml`，`custom/` 下那份不参与 patch。
     #[test]
-    fn package_schema_ids_ignores_nested_and_dedups() {
+    fn flatten_custom_templates_puts_schema_patches_at_rime_root() {
+        let dir = std::env::temp_dir().join(format!("xime_flatten_custom_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("pkg");
+        std::fs::create_dir_all(pkg.join("custom")).unwrap();
+        std::fs::write(pkg.join("custom").join("wanxiang.custom.yaml"), "patch:\n  x: 1\n").unwrap();
+        std::fs::write(pkg.join("custom").join("other.custom.yaml"), "patch:\n  y: 2\n").unwrap();
+        std::fs::write(pkg.join("wanxiang.schema.yaml"), "schema_id: wanxiang\n").unwrap();
+
+        let release_files = vec![
+            (
+                "custom/wanxiang.custom.yaml".to_string(),
+                pkg.join("custom").join("wanxiang.custom.yaml"),
+            ),
+            (
+                "custom/other.custom.yaml".to_string(),
+                pkg.join("custom").join("other.custom.yaml"),
+            ),
+            (
+                "wanxiang.schema.yaml".to_string(),
+                pkg.join("wanxiang.schema.yaml"),
+            ),
+        ];
+        let schema_ids = vec!["wanxiang".to_string()];
+
+        let rime_dir = dir.join("rime");
+        std::fs::create_dir_all(&rime_dir).unwrap();
+        let flattened =
+            flatten_schema_custom_templates(&rime_dir, &release_files, &schema_ids);
+
+        // 只平铺本包自带方案的补丁
+        assert_eq!(flattened, vec!["wanxiang.custom.yaml".to_string()]);
+        assert!(rime_dir.join("wanxiang.custom.yaml").is_file());
+        // 非本包方案的文件不进根目录
+        assert!(!rime_dir.join("other.custom.yaml").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 回归：用户已经改过根目录那份补丁时，重装不能把改动覆盖掉。
+    #[test]
+    fn flatten_custom_templates_keeps_user_edited_root_file() {
+        let dir = std::env::temp_dir().join(format!("xime_flatten_keep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pkg = dir.join("pkg");
+        std::fs::create_dir_all(pkg.join("custom")).unwrap();
+        std::fs::write(pkg.join("custom").join("wanxiang.custom.yaml"), "new-from-package\n").unwrap();
+
+        let release_files = vec![(
+            "custom/wanxiang.custom.yaml".to_string(),
+            pkg.join("custom").join("wanxiang.custom.yaml"),
+        )];
+        let schema_ids = vec!["wanxiang".to_string()];
+
+        let rime_dir = dir.join("rime");
+        std::fs::create_dir_all(&rime_dir).unwrap();
+        std::fs::write(rime_dir.join("wanxiang.custom.yaml"), "user-edited\n").unwrap();
+
+        let flattened = flatten_schema_custom_templates(&rime_dir, &release_files, &schema_ids);
+        assert!(flattened.is_empty());
+        let content = std::fs::read_to_string(rime_dir.join("wanxiang.custom.yaml")).unwrap();
+        assert_eq!(content, "user-edited\n");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 子目录里的 `.schema.yaml` 不算（rime 的 schema_list 只认顶层 id），重复项去重。
+    #[test]    fn package_schema_ids_ignores_nested_and_dedups() {
         let files = [
             "nested/inner.schema.yaml".to_string(),
             "top.schema.yaml".to_string(),

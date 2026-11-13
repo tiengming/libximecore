@@ -20,6 +20,96 @@ fn librime_dir() -> PathBuf {
         .join("librime")
 }
 
+/// rime-lua 仓库（librime 的官方 Lua 插件）。
+const LUA_PLUGIN_REPO: &str = "https://github.com/hchunhui/librime-lua.git";
+
+/// 确认 `librime/plugins/lua` 存在且带可用的 Lua 源码（`thirdparty/lua5.4/lua.h`）。
+///
+/// librime 的 `plugins/CMakeLists.txt` 会把 `plugins/` 下的每个子目录当成插件编进
+/// 主库（`BUILD_MERGED_PLUGINS`），插件模块名随后进入 `RIME_SETUP_EXTRA_MODULES`，
+/// `lua_translator@*` / `lua_filter@*` / `lua_processor@*` 才能被解析。librime 仓库
+/// 本身不带 rime-lua（`plugins/` 只跟踪三个文件），所以默认构建必须自己把它拉下来，
+/// 否则依赖 Lua 的方案（本项目内置的 wubi86 / wubi98 / pinyin_simp，以及万象等
+/// 第三方方案）会静默失效。
+///
+/// rime-lua 的 Lua 源码在 `thirdparty` 分支上，且该分支以 tree 条目存放 lua5.3/5.4/5.5，
+/// 普通 `git clone -b thirdparty --depth 1` 就能拿到完整源码，不需要 submodule 递归。
+///
+/// 拉取失败时**移除残留目录**：只留下没有 Lua 源码的插件目录会让 CMake 在
+/// `plugins/lua/CMakeLists.txt` 里 FATAL_ERROR，直接打断构建；宁可退回「没有 Lua」
+/// 的旧行为，也不要让整个构建失败。
+fn ensure_lua_plugin(librime: &std::path::Path) {
+    let plugins_dir = librime.join("plugins");
+    let plugin_dir = plugins_dir.join("lua");
+    let lua_header = plugin_dir.join("thirdparty").join("lua5.4").join("lua.h");
+
+    if plugin_dir.join("CMakeLists.txt").exists() && lua_header.exists() {
+        return;
+    }
+
+    println!(
+        "cargo:warning=Provisioning rime-lua plugin into {}",
+        plugin_dir.display()
+    );
+
+    let git_ok = |args: &[&str]| -> bool {
+        match Command::new("git").args(args).status() {
+            Ok(s) => s.success(),
+            Err(e) => {
+                println!("cargo:warning=git {:?} failed: {}", args, e);
+                false
+            }
+        }
+    };
+
+    let mut ready = true;
+
+    if !plugin_dir.join("CMakeLists.txt").exists() {
+        if plugin_dir.exists() {
+            std::fs::remove_dir_all(&plugin_dir).ok();
+        }
+        if let Some(parent) = plugin_dir.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        ready = git_ok(&[
+            "clone",
+            "--depth",
+            "1",
+            LUA_PLUGIN_REPO,
+            plugin_dir.to_str().unwrap(),
+        ]);
+    }
+
+    if ready && !lua_header.exists() {
+        let thirdparty = plugin_dir.join("thirdparty");
+        if thirdparty.exists() {
+            std::fs::remove_dir_all(&thirdparty).ok();
+        }
+        ready = git_ok(&[
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            "thirdparty",
+            LUA_PLUGIN_REPO,
+            thirdparty.to_str().unwrap(),
+        ]);
+    }
+
+    if ready && lua_header.exists() {
+        println!("cargo:warning=rime-lua plugin ready at {}", plugin_dir.display());
+        return;
+    }
+
+    println!(
+        "cargo:warning=rime-lua plugin unavailable; Lua-based schema components will be missing"
+    );
+    // 半个插件目录比没有插件更糟：CMake 会 FATAL_ERROR。先清掉再退出。
+    if plugin_dir.exists() {
+        std::fs::remove_dir_all(&plugin_dir).ok();
+    }
+}
+
 #[allow(dead_code)]
 fn check_pkg_config() -> Option<PathBuf> {
     if pkg_config::find_library("rime").is_ok() {
@@ -55,6 +145,8 @@ fn cmake_build(librime: &std::path::Path) -> Option<PathBuf> {
 
     let build_dir = librime.join("build");
     let install_prefix = format!("-DCMAKE_INSTALL_PREFIX={}", dist_dir.display());
+
+    ensure_lua_plugin(librime);
 
     let status = Command::new("cmake")
         .args([
@@ -237,6 +329,7 @@ fn build_librime_source_win(librime_dir: &std::path::Path, _dist_lib_dir: &std::
     }
 
     let workspace_dir = librime_dir.parent().unwrap();
+    ensure_lua_plugin(librime_dir);
     let vswhere = find_vswhere();
     let vs_install: String = match Command::new(&vswhere)
         .args(["-latest", "-property", "installationPath"])
